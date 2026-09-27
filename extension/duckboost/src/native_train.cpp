@@ -42,6 +42,7 @@ int LGBM_DatasetCreateFromMat(const void *data, int data_type, int32_t nrow, int
                               const char *parameters, const DatasetHandle reference, DatasetHandle *out);
 int LGBM_DatasetSetField(DatasetHandle handle, const char *field_name, const void *field_data, int num_element,
                          int type);
+int LGBM_DatasetSetFeatureNames(DatasetHandle handle, const char **feature_names, int num_feature_names);
 int LGBM_DatasetFree(DatasetHandle handle);
 int LGBM_BoosterCreate(const DatasetHandle train_data, const char *parameters, BoosterHandle *out);
 int LGBM_BoosterUpdateOneIter(BoosterHandle handle, int *is_finished);
@@ -266,15 +267,6 @@ BoostModel TrainWithLightGBM(const vector<double> &y, const vector<vector<double
 	}
 
 	string dataset_params = "max_bin=" + std::to_string(MaxValue<idx_t>(options.max_bins, 2));
-	if (!options.feature_names.empty() && options.feature_names.size() == static_cast<idx_t>(ncol)) {
-		dataset_params += " feature_name=";
-		for (idx_t i = 0; i < options.feature_names.size(); i++) {
-			if (i > 0) {
-				dataset_params.push_back(',');
-			}
-			dataset_params += options.feature_names[i];
-		}
-	}
 
 	DatasetHandle dataset = nullptr;
 	if (LGBM_DatasetCreateFromMat(flat.data(), C_API_DTYPE_FLOAT64, nrow, ncol, 1, dataset_params.c_str(), nullptr,
@@ -284,6 +276,16 @@ BoostModel TrainWithLightGBM(const vector<double> &y, const vector<vector<double
 	if (LGBM_DatasetSetField(dataset, "label", labels.data(), nrow, C_API_DTYPE_FLOAT32) != 0) {
 		LGBM_DatasetFree(dataset);
 		ThrowLightGBMError("LGBM_DatasetSetField(label)");
+	}
+	if (!options.feature_names.empty() && options.feature_names.size() == static_cast<idx_t>(ncol)) {
+		vector<const char *> fnames(static_cast<idx_t>(ncol));
+		for (int32_t i = 0; i < ncol; i++) {
+			fnames[static_cast<idx_t>(i)] = options.feature_names[static_cast<idx_t>(i)].c_str();
+		}
+		if (LGBM_DatasetSetFeatureNames(dataset, fnames.data(), ncol) != 0) {
+			LGBM_DatasetFree(dataset);
+			ThrowLightGBMError("LGBM_DatasetSetFeatureNames");
+		}
 	}
 
 	string params = StringUtil::Format(

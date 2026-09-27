@@ -28,32 +28,42 @@ echo "Extracting duckboost OOT layout -> ${OUT}"
 rm -rf "${OUT}"
 mkdir -p "${OUT}"
 
+# Prefer content copy without failing on mount permission bits (e.g. artifact dirs).
+copy_tree() {
+	local from="$1"
+	local to="$2"
+	if cp -R --no-preserve=mode,ownership "${from}" "${to}" 2>/dev/null; then
+		return 0
+	fi
+	cp -R "${from}" "${to}"
+}
+
 # Core sources / docs (keep in-tree layout; dual-mode CMakeLists supports OOT builds)
-cp -a "${SRC}/CMakeLists.txt" "${OUT}/"
-cp -a "${SRC}/duckboost_extension.cpp" "${OUT}/"
-cp -a "${SRC}/extension_config.cmake" "${OUT}/"
-cp -a "${SRC}/LICENSE" "${OUT}/"
-cp -a "${SRC}/README.md" "${OUT}/"
-cp -a "${SRC}/PACKAGING.md" "${OUT}/"
-cp -a "${SRC}/include" "${OUT}/"
-cp -a "${SRC}/src" "${OUT}/"
+cp "${SRC}/CMakeLists.txt" "${OUT}/"
+cp "${SRC}/duckboost_extension.cpp" "${OUT}/"
+cp "${SRC}/extension_config.cmake" "${OUT}/"
+cp "${SRC}/LICENSE" "${OUT}/"
+cp "${SRC}/README.md" "${OUT}/"
+cp "${SRC}/PACKAGING.md" "${OUT}/"
+copy_tree "${SRC}/include" "${OUT}/include"
+copy_tree "${SRC}/src" "${OUT}/src"
 
 # Keep test/sql/duckboost/... so read_text('test/sql/duckboost/data/...') paths work.
 mkdir -p "${OUT}/test/sql"
 if [[ -d "${ROOT}/test/sql/duckboost" ]]; then
-	cp -a "${ROOT}/test/sql/duckboost" "${OUT}/test/sql/"
+	copy_tree "${ROOT}/test/sql/duckboost" "${OUT}/test/sql/duckboost"
 elif [[ -d "${SRC}/test" ]]; then
-	cp -a "${SRC}/test/." "${OUT}/test/"
+	copy_tree "${SRC}/test" "${OUT}/test"
 fi
 
 # Community / template scaffolding
-cp -a "${SRC}/community/oot/Makefile" "${OUT}/"
-cp -a "${SRC}/community/oot/vcpkg.json" "${OUT}/"
-cp -a "${SRC}/community/oot/.gitignore" "${OUT}/"
+cp "${SRC}/community/oot/Makefile" "${OUT}/"
+cp "${SRC}/community/oot/vcpkg.json" "${OUT}/"
+cp "${SRC}/community/oot/.gitignore" "${OUT}/"
 mkdir -p "${OUT}/.github/workflows"
-cp -a "${SRC}/community/oot/.github/workflows/MainDistributionPipeline.yml" "${OUT}/.github/workflows/"
+cp "${SRC}/community/oot/.github/workflows/MainDistributionPipeline.yml" "${OUT}/.github/workflows/"
 mkdir -p "${OUT}/docs"
-cp -a "${SRC}/community/description.yml" "${OUT}/docs/community_extensions_description.yml"
+cp "${SRC}/community/description.yml" "${OUT}/docs/community_extensions_description.yml"
 
 # Minimal README pointer for the standalone repo
 cat > "${OUT}/docs/COMMUNITY_PUBLISH.md" <<'EOF'

@@ -57,10 +57,17 @@ Or place the repo at `duckdb/extension_external/duckboost` and load by name.
 
 | CMake option | Env hint | Effect |
 | --- | --- | --- |
-| `DUCKBOOST_WITH_XGBOOST=ON` | `XGBOOST_ROOT` | Compile/link XGBoost trainer path |
-| `DUCKBOOST_WITH_LIGHTGBM=ON` | `LIGHTGBM_ROOT` | Compile/link LightGBM trainer path |
-| `DUCKBOOST_WITH_CATBOOST=ON` | `CATBOOST_ROOT` | Compile/link CatBoost trainer path |
+| `DUCKBOOST_WITH_XGBOOST=ON` | `XGBOOST_ROOT` | Link XGBoost C API train bridge |
+| `DUCKBOOST_WITH_LIGHTGBM=ON` | `LIGHTGBM_ROOT` | Link LightGBM C API train bridge |
+| `DUCKBOOST_WITH_CATBOOST=ON` | — | Compile-time capability flag only (no train C API) |
 | `DUCKBOOST_NATIVE_STUB_ONLY=ON` | — | Compile `#ifdef` paths without linking vendor libs |
+
+Example:
+
+```bash
+EXTRA_CMAKE_VARIABLES='-DDUCKBOOST_WITH_XGBOOST=ON -DDUCKBOOST_WITH_LIGHTGBM=ON' \
+  DUCKDB_EXTENSIONS='duckboost' make reldebug
+```
 
 Inspect the active build:
 
@@ -69,4 +76,4 @@ SELECT * FROM duckboost_build_info();
 SELECT * FROM duckboost_backends();
 ```
 
-Until the vendor C API bridges are finished, prefer `duckboost_import()` for production boosters and `backend='reference'` for in-process experiments.
+Linked XGBoost/LightGBM builds set `training_supported=true` for those backends. CatBoost remains import-only.

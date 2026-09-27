@@ -619,6 +619,12 @@ void BuildInfoFunction(ClientContext &, TableFunctionInput &data, DataChunk &out
 	     "NativeTrainerCompiled(lightgbm)"},
 	    {"native_catboost_compiled", NativeTrainerCompiled(BoostBackend::CATBOOST),
 	     "NativeTrainerCompiled(catboost)"},
+	    {"native_xgboost_linked", NativeTrainerLinked(BoostBackend::XGBOOST),
+	     "NativeTrainerLinked(xgboost) — C API train bridge"},
+	    {"native_lightgbm_linked", NativeTrainerLinked(BoostBackend::LIGHTGBM),
+	     "NativeTrainerLinked(lightgbm) — C API train bridge"},
+	    {"native_catboost_linked", NativeTrainerLinked(BoostBackend::CATBOOST),
+	     "Always false: CatBoost has no public train C API"},
 	};
 	static constexpr idx_t prop_count = sizeof(props) / sizeof(props[0]);
 	if (state.offset >= prop_count) {

@@ -1,0 +1,94 @@
+# name: test/sql/duckboost/native_train.test
+# description: Native XGBoost/LightGBM C API train bridges (requires linked vendor libs)
+# group: [duckboost]
+
+require duckboost
+# Set DUCKBOOST_NATIVE_TRAIN_TEST=1 when building with DUCKBOOST_WITH_XGBOOST/LIGHTGBM linked.
+require-env DUCKBOOST_NATIVE_TRAIN_TEST
+
+statement ok
+CREATE TABLE train AS
+SELECT * FROM (VALUES
+	(0.0, 0.0, 0.0),
+	(0.0, 1.0, 0.0),
+	(0.0, 0.0, 1.0),
+	(1.0, 1.0, 1.0),
+	(1.0, 2.0, 1.0),
+	(1.0, 2.0, 0.0),
+	(0.0, 0.5, 0.5),
+	(1.0, 1.5, 1.5)
+) t(y, x1, x2);
+
+# Skip XGBoost cases when that backend is not linked in this build
+query I
+SELECT enabled FROM duckboost_build_info() WHERE name = 'native_xgboost_linked';
+----
+true
+
+statement ok
+CREATE TABLE xgb_models AS
+SELECT duckboost_train(
+	y, [x1, x2],
+	MAP {
+		'backend': 'xgboost',
+		'task': 'regression',
+		'n_estimators': '8',
+		'max_depth': '2',
+		'learning_rate': '0.3',
+		'feature_names': 'x1,x2'
+	}
+) AS model
+FROM train;
+
+query I
+SELECT duckboost_evaluate_agg(model, y, [x1, x2], MAP {'metric': 'rmse'}) < 0.45
+FROM xgb_models, train;
+----
+true
+
+query I
+SELECT abs(duckboost_predict(model, [x1, x2]) - y) < 1.0
+FROM xgb_models, train
+LIMIT 1;
+----
+true
+
+query I
+SELECT training_supported FROM duckboost_backends() WHERE backend = 'xgboost';
+----
+true
+
+# LightGBM
+query I
+SELECT enabled FROM duckboost_build_info() WHERE name = 'native_lightgbm_linked';
+----
+true
+
+statement ok
+CREATE TABLE lgb_models AS
+SELECT duckboost_train(
+	y, [x1, x2],
+	MAP {
+		'backend': 'lightgbm',
+		'task': 'regression',
+		'n_estimators': '8',
+		'max_depth': '2',
+		'learning_rate': '0.3',
+		'min_samples_leaf': '1',
+		'feature_names': 'x1,x2'
+	}
+) AS model
+FROM train;
+
+query I
+SELECT duckboost_evaluate_agg(model, y, [x1, x2], MAP {'metric': 'rmse'}) < 0.45
+FROM lgb_models, train;
+----
+true
+
+# CatBoost still has no train C API even in native test builds
+statement error
+SELECT duckboost_train(y, [x1, x2], MAP {'backend': 'catboost', 'n_estimators': '2'})
+FROM train;
+----
+<REGEX>:.*CatBoost has no public.*

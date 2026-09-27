@@ -48,11 +48,20 @@ if(DUCKBOOST_WITH_XGBOOST)
       message(FATAL_ERROR "duckboost: DUCKBOOST_WITH_XGBOOST=ON but libxgboost not found (set XGBOOST_ROOT or use "
                           "DUCKBOOST_NATIVE_STUB_ONLY=ON)")
     endif()
-    # build_extension_library uses the plain target_link_libraries signature.
-    target_link_libraries(duckboost_extension ${XGBOOST_LIBRARY})
     get_filename_component(XGBOOST_LIB_DIR "${XGBOOST_LIBRARY}" DIRECTORY)
-    set_property(TARGET duckboost_extension APPEND PROPERTY BUILD_RPATH "${XGBOOST_LIB_DIR}")
+    # Pip wheels ship libxgboost.so with SONAME libxgboost.so.3; stage a soname link for the linker.
+    set(DUCKBOOST_XGB_STAGE "${CMAKE_BINARY_DIR}/duckboost_native_libs")
+    file(MAKE_DIRECTORY "${DUCKBOOST_XGB_STAGE}")
+    execute_process(COMMAND ${CMAKE_COMMAND} -E create_symlink "${XGBOOST_LIBRARY}"
+                            "${DUCKBOOST_XGB_STAGE}/libxgboost.so")
+    execute_process(COMMAND ${CMAKE_COMMAND} -E create_symlink "${XGBOOST_LIBRARY}"
+                            "${DUCKBOOST_XGB_STAGE}/libxgboost.so.3")
+    # build_extension_library uses the plain target_link_libraries signature.
+    target_link_libraries(duckboost_extension "${DUCKBOOST_XGB_STAGE}/libxgboost.so")
+    set_property(TARGET duckboost_extension APPEND PROPERTY BUILD_RPATH "${DUCKBOOST_XGB_STAGE};${XGBOOST_LIB_DIR}")
     set_property(TARGET duckboost_extension APPEND PROPERTY INSTALL_RPATH "${XGBOOST_LIB_DIR}")
+    set(CMAKE_BUILD_RPATH "${CMAKE_BUILD_RPATH};${DUCKBOOST_XGB_STAGE};${XGBOOST_LIB_DIR}")
+    link_directories("${DUCKBOOST_XGB_STAGE}" "${XGBOOST_LIB_DIR}")
     message(STATUS "duckboost: linking XGBoost (${XGBOOST_LIBRARY})")
   endif()
 endif()
@@ -82,6 +91,8 @@ if(DUCKBOOST_WITH_LIGHTGBM)
     get_filename_component(LIGHTGBM_LIB_DIR "${LIGHTGBM_LIBRARY}" DIRECTORY)
     set_property(TARGET duckboost_extension APPEND PROPERTY BUILD_RPATH "${LIGHTGBM_LIB_DIR}")
     set_property(TARGET duckboost_extension APPEND PROPERTY INSTALL_RPATH "${LIGHTGBM_LIB_DIR}")
+    set(CMAKE_BUILD_RPATH "${CMAKE_BUILD_RPATH};${LIGHTGBM_LIB_DIR}")
+    link_directories("${LIGHTGBM_LIB_DIR}")
     message(STATUS "duckboost: linking LightGBM (${LIGHTGBM_LIBRARY})")
   endif()
 endif()

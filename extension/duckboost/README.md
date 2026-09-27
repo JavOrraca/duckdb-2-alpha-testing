@@ -23,20 +23,32 @@ BUILD_DUCKBOOST=1 make reldebug
 EXTENSION_CONFIGS=extension/duckboost/extension_config.cmake make reldebug
 ```
 
-Optional native trainer compile flags (C API bridges not implemented yet — stubs throw until vendor libs are wired):
+Optional native trainer flags (XGBoost / LightGBM train via vendor C API → dump → import):
 
 ```bash
+# Link real libraries (pip wheels work; set ROOT or rely on auto-detect under ~/.local)
+EXTRA_CMAKE_VARIABLES='-DDUCKBOOST_WITH_XGBOOST=ON -DDUCKBOOST_WITH_LIGHTGBM=ON' \
+  DUCKDB_EXTENSIONS='duckboost' make reldebug
+
 # Compile #ifdef paths without linking vendor libraries
-cmake ... -DDUCKBOOST_WITH_XGBOOST=ON -DDUCKBOOST_NATIVE_STUB_ONLY=ON
-# Or link a real install (bridge still pending):
-cmake ... -DDUCKBOOST_WITH_XGBOOST=ON -DXGBOOST_ROOT=/path/to/xgboost
+EXTRA_CMAKE_VARIABLES='-DDUCKBOOST_WITH_XGBOOST=ON -DDUCKBOOST_NATIVE_STUB_ONLY=ON' \
+  DUCKDB_EXTENSIONS='duckboost' make reldebug
 ```
+
+CatBoost has no public in-process training C API — use `duckboost_import('catboost', ...)`.
 
 Inspect the active build:
 
 ```sql
 SELECT * FROM duckboost_build_info();
 SELECT * FROM duckboost_backends();
+```
+
+Native train tests (linked builds only):
+
+```bash
+export LD_LIBRARY_PATH="$HOME/.local/lib/python3.12/site-packages/xgboost/lib:$HOME/.local/lib/python3.12/site-packages/lightgbm/lib:${LD_LIBRARY_PATH}"
+DUCKBOOST_NATIVE_TRAIN_TEST=1 build/reldebug/test/unittest test/sql/duckboost/native_train.test
 ```
 
 Then:
@@ -110,7 +122,7 @@ SELECT duckboost_predict(model, features), duckboost_predict_proba(model, featur
 | `lightgbm` | Optional (`DUCKBOOST_WITH_LIGHTGBM`) | `booster_.save_model()` text | Yes |
 | `catboost` | Optional (`DUCKBOOST_WITH_CATBOOST`) | `save_model(..., format='json')` float trees | Yes |
 
-Native XGBoost / LightGBM / CatBoost linking is intentionally opt-in via `DUCKBOOST_WITH_*`. Until the vendor C API bridges land, those flags only compile stub entry points; prefer `duckboost_import()` for production boosters and `backend='reference'` for in-process experiments.
+Native XGBoost / LightGBM linking is opt-in via `DUCKBOOST_WITH_*`. Linked builds train in-process through the vendor C API, then convert the dump into duckboost JSON. CatBoost remains import-only. Prefer `duckboost_import()` when you already train outside DuckDB; use `backend='reference'` for dependency-free experiments.
 
 ### Dump import notes
 
@@ -152,5 +164,5 @@ For `task: "multiclass"`, `n_classes >= 2`, optional `base_scores` holds per-cla
 
 - [x] Native trainer scaffolding behind `DUCKBOOST_WITH_*` / `DUCKBOOST_NATIVE_STUB_ONLY` + `duckboost_build_info()`
 - [x] Community packaging docs (`PACKAGING.md`, local `extension_config.cmake`)
-- [ ] Vendor C API bridges (train → dump → import into `BoostModel`)
+- [x] Vendor C API bridges for XGBoost / LightGBM (train → dump → import into `BoostModel`)
 - [ ] Publish as a DuckDB community extension

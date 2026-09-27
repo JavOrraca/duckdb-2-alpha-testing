@@ -19,7 +19,7 @@ WHERE name = 'DUCKBOOST_NATIVE_STUB';
 DUCKBOOST_NATIVE_STUB	false	true
 
 query I
-SELECT count(*) >= 7 FROM duckboost_build_info();
+SELECT count(*) >= 10 FROM duckboost_build_info();
 ----
 true
 
@@ -31,6 +31,11 @@ true
 
 query I
 SELECT bool_or(training_supported) FROM duckboost_backends() WHERE backend != 'reference';
+----
+false
+
+query I
+SELECT enabled FROM duckboost_build_info() WHERE name = 'native_xgboost_linked';
 ----
 false
 

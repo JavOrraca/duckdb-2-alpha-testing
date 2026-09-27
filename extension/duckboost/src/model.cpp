@@ -1,5 +1,6 @@
 #include "duckboost/model.hpp"
 #include "duckboost/json_util.hpp"
+#include "duckboost/native_train.hpp"
 
 #include "duckdb/common/numeric_utils.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -275,7 +276,10 @@ BoostTask TaskFromString(const string &name) {
 }
 
 bool BackendTrainingSupported(BoostBackend backend) {
-	return backend == BoostBackend::REFERENCE;
+	if (backend == BoostBackend::REFERENCE) {
+		return true;
+	}
+	return NativeTrainerLinked(backend);
 }
 
 string BackendCapabilityNote(BoostBackend backend) {
@@ -283,23 +287,26 @@ string BackendCapabilityNote(BoostBackend backend) {
 	case BoostBackend::REFERENCE:
 		return "in-process reference GBDT (train/predict/evaluate/to_sql)";
 	case BoostBackend::XGBOOST:
-#if defined(DUCKBOOST_WITH_XGBOOST)
-		return "import dump_model JSON via duckboost_import; DUCKBOOST_WITH_XGBOOST compiled (C API bridge pending)";
-#else
+		if (NativeTrainerLinked(backend)) {
+			return "native train via XGBoost C API (dump→import); also duckboost_import dump_model JSON";
+		}
+		if (NativeTrainerCompiled(backend)) {
+			return "import dump_model JSON via duckboost_import; native train compiled as stub";
+		}
 		return "import dump_model JSON via duckboost_import; native train requires DUCKBOOST_WITH_XGBOOST";
-#endif
 	case BoostBackend::LIGHTGBM:
-#if defined(DUCKBOOST_WITH_LIGHTGBM)
-		return "import save_model text via duckboost_import; DUCKBOOST_WITH_LIGHTGBM compiled (C API bridge pending)";
-#else
+		if (NativeTrainerLinked(backend)) {
+			return "native train via LightGBM C API (dump→import); also duckboost_import save_model text";
+		}
+		if (NativeTrainerCompiled(backend)) {
+			return "import save_model text via duckboost_import; native train compiled as stub";
+		}
 		return "import save_model text via duckboost_import; native train requires DUCKBOOST_WITH_LIGHTGBM";
-#endif
 	case BoostBackend::CATBOOST:
-#if defined(DUCKBOOST_WITH_CATBOOST)
-		return "import save_model JSON via duckboost_import; DUCKBOOST_WITH_CATBOOST compiled (C API bridge pending)";
-#else
-		return "import save_model JSON via duckboost_import; native train requires DUCKBOOST_WITH_CATBOOST";
-#endif
+		if (NativeTrainerCompiled(backend)) {
+			return "import save_model JSON via duckboost_import; no public CatBoost train C API (use dump import)";
+		}
+		return "import save_model JSON via duckboost_import; native train requires dump import (no public C API)";
 	default:
 		return "unknown";
 	}

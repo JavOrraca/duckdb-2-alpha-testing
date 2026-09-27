@@ -55,11 +55,8 @@ SELECT duckboost_predict((SELECT model FROM models), [10.0, 1.0]) IS NOT NULL;
 ----
 true
 
-# External backends are selectable but not natively trainable in this build
-statement error
-SELECT duckboost_train(y, [x1, x2], MAP {'backend': 'xgboost'}) FROM train;
-----
-<REGEX>:.*native training for backend 'xgboost'.*
+# Native train availability depends on DUCKBOOST_WITH_* linking; see build_info.test
+# (default build) and native_train.test (linked build).
 
 # Import tags a duckboost JSON model with another backend name
 query I

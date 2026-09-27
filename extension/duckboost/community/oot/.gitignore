@@ -1,0 +1,9 @@
+build/
+duckdb/
+extension-ci-tools/
+.idea/
+.vscode/
+*.duckdb
+*.duckdb.wal
+.DS_Store
+vcpkg_installed/

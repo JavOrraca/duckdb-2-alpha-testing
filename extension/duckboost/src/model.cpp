@@ -171,12 +171,12 @@ string SqlCtrElementValueExpr(const CtrCombineElement &element, const vector<str
 }
 
 string SqlCombineCtrHashExpr(const CtrFeatureSpec &ctr, const vector<string> &feature_columns) {
-	static constexpr const char *MAGIC = "5260239421824346981::UHUGEINT"; // 0x4906ba494954cb65
-	static constexpr const char *MOD = "18446744073709551616::UHUGEINT";
+	const string magic = "5260239421824346981::UHUGEINT"; // 0x4906ba494954cb65
+	const string mod = "18446744073709551616::UHUGEINT";
 	string hash = "0::UHUGEINT";
 	auto append_value = [&](const string &value_expr) {
-		hash = "((" + MAGIC + " * ((" + hash + " + ((" + MAGIC + " * (" + value_expr + ")) % " + MOD + ")) % " + MOD +
-		       ")) % " + MOD + ")";
+		hash = "((" + magic + " * ((" + hash + " + ((" + magic + " * (" + value_expr + ")) % " + mod + ")) % " + mod +
+		       ")) % " + mod + ")";
 	};
 	if (!ctr.elements.empty()) {
 		for (auto &element : ctr.elements) {

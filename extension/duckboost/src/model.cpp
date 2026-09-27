@@ -283,11 +283,23 @@ string BackendCapabilityNote(BoostBackend backend) {
 	case BoostBackend::REFERENCE:
 		return "in-process reference GBDT (train/predict/evaluate/to_sql)";
 	case BoostBackend::XGBOOST:
+#if defined(DUCKBOOST_WITH_XGBOOST)
+		return "import dump_model JSON via duckboost_import; DUCKBOOST_WITH_XGBOOST compiled (C API bridge pending)";
+#else
 		return "import dump_model JSON via duckboost_import; native train requires DUCKBOOST_WITH_XGBOOST";
+#endif
 	case BoostBackend::LIGHTGBM:
+#if defined(DUCKBOOST_WITH_LIGHTGBM)
+		return "import save_model text via duckboost_import; DUCKBOOST_WITH_LIGHTGBM compiled (C API bridge pending)";
+#else
 		return "import save_model text via duckboost_import; native train requires DUCKBOOST_WITH_LIGHTGBM";
+#endif
 	case BoostBackend::CATBOOST:
+#if defined(DUCKBOOST_WITH_CATBOOST)
+		return "import save_model JSON via duckboost_import; DUCKBOOST_WITH_CATBOOST compiled (C API bridge pending)";
+#else
 		return "import save_model JSON via duckboost_import; native train requires DUCKBOOST_WITH_CATBOOST";
+#endif
 	default:
 		return "unknown";
 	}

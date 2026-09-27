@@ -1,6 +1,7 @@
 #include "duckboost/functions.hpp"
 #include "duckboost/import.hpp"
 #include "duckboost/model.hpp"
+#include "duckboost/native_train.hpp"
 
 #include "duckdb/catalog/default/default_table_functions.hpp"
 #include "duckdb/common/constants.hpp"
@@ -560,6 +561,83 @@ void BackendsFunction(ClientContext &, TableFunctionInput &data, DataChunk &outp
 	state.offset += count;
 }
 
+struct BuildInfoRow {
+	const char *name;
+	bool enabled;
+	const char *notes;
+};
+
+struct BuildInfoData : public GlobalTableFunctionState {
+	idx_t offset = 0;
+};
+
+unique_ptr<FunctionData> BuildInfoBind(ClientContext &, TableFunctionBindInput &, vector<LogicalType> &return_types,
+                                       vector<Identifier> &names) {
+	names = {"name", "enabled", "notes"};
+	return_types = {LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::VARCHAR};
+	return nullptr;
+}
+
+unique_ptr<GlobalTableFunctionState> BuildInfoInit(ClientContext &, TableFunctionInitInput &) {
+	return make_uniq<BuildInfoData>();
+}
+
+void BuildInfoFunction(ClientContext &, TableFunctionInput &data, DataChunk &output) {
+	auto &state = data.global_state->Cast<BuildInfoData>();
+	static const BuildInfoProp props[] = {
+	    {"DUCKBOOST_WITH_XGBOOST",
+#if defined(DUCKBOOST_WITH_XGBOOST)
+	     true,
+#else
+	     false,
+#endif
+	     "XGBoost native trainer compile flag"},
+	    {"DUCKBOOST_WITH_LIGHTGBM",
+#if defined(DUCKBOOST_WITH_LIGHTGBM)
+	     true,
+#else
+	     false,
+#endif
+	     "LightGBM native trainer compile flag"},
+	    {"DUCKBOOST_WITH_CATBOOST",
+#if defined(DUCKBOOST_WITH_CATBOOST)
+	     true,
+#else
+	     false,
+#endif
+	     "CatBoost native trainer compile flag"},
+	    {"DUCKBOOST_NATIVE_STUB",
+#if defined(DUCKBOOST_NATIVE_STUB)
+	     true,
+#else
+	     false,
+#endif
+	     "Native trainers compiled as stubs (no vendor link)"},
+	    {"native_xgboost_compiled", NativeTrainerCompiled(BoostBackend::XGBOOST),
+	     "NativeTrainerCompiled(xgboost)"},
+	    {"native_lightgbm_compiled", NativeTrainerCompiled(BoostBackend::LIGHTGBM),
+	     "NativeTrainerCompiled(lightgbm)"},
+	    {"native_catboost_compiled", NativeTrainerCompiled(BoostBackend::CATBOOST),
+	     "NativeTrainerCompiled(catboost)"},
+	};
+	static constexpr idx_t prop_count = sizeof(props) / sizeof(props[0]);
+	if (state.offset >= prop_count) {
+		return;
+	}
+	const idx_t remaining = prop_count - state.offset;
+	const idx_t count = MinValue<idx_t>(remaining, STANDARD_VECTOR_SIZE);
+	auto name_writer = FlatVector::Writer<string_t>(output.data[0], count);
+	auto enabled_writer = FlatVector::Writer<bool>(output.data[1], count);
+	auto notes_writer = FlatVector::Writer<string_t>(output.data[2], count);
+	for (idx_t i = 0; i < count; i++) {
+		auto &prop = props[state.offset + i];
+		name_writer.WriteValue(StringVector::AddString(output.data[0], prop.name));
+		enabled_writer.WriteValue(prop.enabled);
+		notes_writer.WriteValue(StringVector::AddString(output.data[2], prop.notes));
+	}
+	state.offset += count;
+}
+
 } // namespace
 
 // clang-format off
@@ -665,6 +743,9 @@ void RegisterDuckBoostFunctions(ExtensionLoader &loader) {
 
 	TableFunction backends_fun("duckboost_backends", {}, BackendsFunction, BackendsBind, BackendsInit);
 	loader.RegisterFunction(backends_fun);
+
+	TableFunction build_info_fun("duckboost_build_info", {}, BuildInfoFunction, BuildInfoBind, BuildInfoInit);
+	loader.RegisterFunction(build_info_fun);
 
 	RegisterDuckBoostMacros(loader);
 }

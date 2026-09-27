@@ -584,7 +584,7 @@ unique_ptr<GlobalTableFunctionState> BuildInfoInit(ClientContext &, TableFunctio
 
 void BuildInfoFunction(ClientContext &, TableFunctionInput &data, DataChunk &output) {
 	auto &state = data.global_state->Cast<BuildInfoData>();
-	static const BuildInfoProp props[] = {
+	static const BuildInfoRow props[] = {
 	    {"DUCKBOOST_WITH_XGBOOST",
 #if defined(DUCKBOOST_WITH_XGBOOST)
 	     true,

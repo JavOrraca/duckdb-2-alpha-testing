@@ -165,4 +165,5 @@ For `task: "multiclass"`, `n_classes >= 2`, optional `base_scores` holds per-cla
 - [x] Native trainer scaffolding behind `DUCKBOOST_WITH_*` / `DUCKBOOST_NATIVE_STUB_ONLY` + `duckboost_build_info()`
 - [x] Community packaging docs (`PACKAGING.md`, local `extension_config.cmake`)
 - [x] Vendor C API bridges for XGBoost / LightGBM (train → dump → import into `BoostModel`)
-- [ ] Publish as a DuckDB community extension
+- [x] Community publish kit (`community/description.yml`, `scripts/extract_duckboost_oot.sh`, dual-mode CMake)
+- [ ] Push standalone `JavOrraca/duckboost` repo + open PR on `duckdb/community-extensions`

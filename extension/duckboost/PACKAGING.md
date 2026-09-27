@@ -61,16 +61,20 @@ make                     # clones duckdb + extension-ci-tools and builds
 
 ## Submit to DuckDB community extensions
 
+See [`community/SUBMIT.md`](community/SUBMIT.md) for the current commit SHA and
+one-shot PR steps.
+
+Publish surface (already pushed): orphan branch
+`cursor/duckboost-community-oot-0c09` on `JavOrraca/duckdb-2-alpha-testing`
+(extension-template layout at repo root — **do not merge** into `v2.0-cyanoptera`).
+
 Community extensions are registered with a single YAML descriptor in
 [duckdb/community-extensions](https://github.com/duckdb/community-extensions):
 
-1. Publish the extracted standalone repo (public GitHub).
-2. Copy [`community/description.yml`](community/description.yml) (also written to
-   `docs/community_extensions_description.yml` by the extract script) into a fork as
-   `extensions/duckboost/description.yml`.
-3. Set `repo.github` / `repo.ref` to your published repo and commit SHA.
-4. Open a PR containing **only** that file.
-5. After merge and CI, users install with:
+1. Copy [`community/description.yml`](community/description.yml) into a fork as
+   `extensions/duckboost/description.yml` (that file only).
+2. Open a PR against `duckdb/community-extensions`.
+3. After merge and CI, users install with:
 
 ```sql
 INSTALL duckboost FROM community;
@@ -87,7 +91,8 @@ Docs: https://duckdb.org/community_extensions/documentation.html
 | `extension.version` | `0.1.0` (bump on release) |
 | `extension.license` | `MIT` |
 | `extension.maintainers` | `JavOrraca` |
-| `repo.github` | `JavOrraca/duckboost` (create if needed) |
+| `repo.github` | `JavOrraca/duckdb-2-alpha-testing` |
+| `repo.ref` | SHA of `cursor/duckboost-community-oot-0c09` (see `description.yml`) |
 
 Default community binaries intentionally omit vendor ML libraries: they ship the
 reference trainer + dump import. Optional `DUCKBOOST_WITH_*` native trainers are for

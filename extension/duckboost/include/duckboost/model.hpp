@@ -38,11 +38,7 @@ struct BoostTree {
 	vector<TreeNode> nodes;
 };
 
-enum class CtrElementKind : uint8_t {
-	CAT_FEATURE_VALUE = 0,
-	FLOAT_FEATURE = 1,
-	CAT_FEATURE_EXACT_VALUE = 2
-};
+enum class CtrElementKind : uint8_t { CAT_FEATURE_VALUE = 0, FLOAT_FEATURE = 1, CAT_FEATURE_EXACT_VALUE = 2 };
 
 //! One component of a CatBoost CTR combination hash.
 struct CtrCombineElement {

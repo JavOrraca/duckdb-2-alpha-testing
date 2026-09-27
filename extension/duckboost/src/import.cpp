@@ -277,8 +277,7 @@ idx_t ExpandCatBoost(idx_t depth, idx_t path_bits, const vector<idx_t> &features
 	auto idx = tree.nodes.size();
 	tree.nodes.push_back(node);
 	// False → left / bit 0; True → right / bit 1
-	tree.nodes[idx].left =
-	    ExpandCatBoost(depth + 1, path_bits << 1, features, thresholds, compares, leaf_values, tree);
+	tree.nodes[idx].left = ExpandCatBoost(depth + 1, path_bits << 1, features, thresholds, compares, leaf_values, tree);
 	tree.nodes[idx].right =
 	    ExpandCatBoost(depth + 1, (path_bits << 1) | 1, features, thresholds, compares, leaf_values, tree);
 	return idx;
@@ -667,7 +666,8 @@ BoostModel ImportCatBoostJSON(const string &dump, const ImportOptions &options) 
 								ctr.identifier = p.ParseString();
 							} else if (ckey == "prior_numerator") {
 								ctr.prior_numerator = p.ParseNumber();
-							} else if (ckey == "prior_denomerator" || ckey == "prior_denominator") {
+							} else if (ckey == "prior_denomerator" || // typos:ignore
+							           ckey == "prior_denominator") {
 								ctr.prior_denominator = p.ParseNumber();
 							} else if (ckey == "scale") {
 								ctr.scale = p.ParseNumber();
@@ -765,9 +765,9 @@ BoostModel ImportCatBoostJSON(const string &dump, const ImportOptions &options) 
 								tokens.push_back(std::to_string(static_cast<int64_t>(p.ParseNumber())));
 							}
 						}
-						// Store raw tokens temporarily in hash_keys as 0 and values as sentinel via string side channel:
-						// We'll reinterpret after ctr_type is known; keep tokens in hash_values size as packed later.
-						// For now assume Counter stride=2 (key, count) unless Borders (key, fail, success).
+						// Store raw tokens temporarily in hash_keys as 0 and values as sentinel via string side
+						// channel: We'll reinterpret after ctr_type is known; keep tokens in hash_values size as packed
+						// later. For now assume Counter stride=2 (key, count) unless Borders (key, fail, success).
 						// Parse as Counter by default; Borders rewrite when matched to ctr_infos.
 						for (idx_t i = 0; i + 1 < tokens.size();) {
 							spec.hash_keys.push_back(std::stoull(tokens[i]));
@@ -892,8 +892,8 @@ BoostModel ImportCatBoostJSON(const string &dump, const ImportOptions &options) 
 								split.compare = SplitCompare::LESS;
 								split.resolved = false; // always resolve via split_index / ctr tables
 							} else {
-								throw NotImplementedException(
-								    "duckboost: catboost split_type '%s' is not supported", st);
+								throw NotImplementedException("duckboost: catboost split_type '%s' is not supported",
+								                              st);
 							}
 							tree.splits.push_back(split);
 						}
@@ -1090,8 +1090,7 @@ BoostModel ImportCatBoostJSON(const string &dump, const ImportOptions &options) 
 			SplitCompare compare = split.compare;
 			if (split.kind == CatSplitKind::ONE_HOT && split.resolved) {
 				// Inline OneHot uses cat_feature_index; map to flat when possible.
-				if (feature < cat_features.size() &&
-				    cat_features[feature].feature_index == feature) {
+				if (feature < cat_features.size() && cat_features[feature].feature_index == feature) {
 					feature = cat_features[feature].flat_feature_index;
 				} else {
 					for (auto &cf : cat_features) {

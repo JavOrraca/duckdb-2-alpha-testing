@@ -613,12 +613,9 @@ void BuildInfoFunction(ClientContext &, TableFunctionInput &data, DataChunk &out
 	     false,
 #endif
 	     "Native trainers compiled as stubs (no vendor link)"},
-	    {"native_xgboost_compiled", NativeTrainerCompiled(BoostBackend::XGBOOST),
-	     "NativeTrainerCompiled(xgboost)"},
-	    {"native_lightgbm_compiled", NativeTrainerCompiled(BoostBackend::LIGHTGBM),
-	     "NativeTrainerCompiled(lightgbm)"},
-	    {"native_catboost_compiled", NativeTrainerCompiled(BoostBackend::CATBOOST),
-	     "NativeTrainerCompiled(catboost)"},
+	    {"native_xgboost_compiled", NativeTrainerCompiled(BoostBackend::XGBOOST), "NativeTrainerCompiled(xgboost)"},
+	    {"native_lightgbm_compiled", NativeTrainerCompiled(BoostBackend::LIGHTGBM), "NativeTrainerCompiled(lightgbm)"},
+	    {"native_catboost_compiled", NativeTrainerCompiled(BoostBackend::CATBOOST), "NativeTrainerCompiled(catboost)"},
 	    {"native_xgboost_linked", NativeTrainerLinked(BoostBackend::XGBOOST),
 	     "NativeTrainerLinked(xgboost) — C API train bridge"},
 	    {"native_lightgbm_linked", NativeTrainerLinked(BoostBackend::LIGHTGBM),
@@ -734,9 +731,7 @@ void RegisterDuckBoostFunctions(ExtensionLoader &loader) {
 	ScalarFunctionSet import_set("duckboost_import");
 	ScalarFunction import_fun({}, LogicalType::VARCHAR, ImportFunction);
 	import_fun.SetFallible();
-	import_fun.GetSignature()
-	    .AddParameter("backend", LogicalType::VARCHAR)
-	    .AddParameter("dump", LogicalType::VARCHAR);
+	import_fun.GetSignature().AddParameter("backend", LogicalType::VARCHAR).AddParameter("dump", LogicalType::VARCHAR);
 	import_set.AddFunction(import_fun);
 	ScalarFunction import_opts({}, LogicalType::VARCHAR, ImportFunction);
 	import_opts.SetFallible();

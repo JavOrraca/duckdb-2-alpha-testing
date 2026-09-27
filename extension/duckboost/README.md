@@ -17,6 +17,26 @@ Experimental DuckDB extension for **in-database gradient boosting**: train and e
 DUCKDB_EXTENSIONS='duckboost' make reldebug
 # or
 EXTENSION_CONFIGS=.github/config/extensions/duckboost.cmake make reldebug
+# or
+BUILD_DUCKBOOST=1 make reldebug
+# out-of-tree style (same sources via local extension_config.cmake)
+EXTENSION_CONFIGS=extension/duckboost/extension_config.cmake make reldebug
+```
+
+Optional native trainer compile flags (C API bridges not implemented yet — stubs throw until vendor libs are wired):
+
+```bash
+# Compile #ifdef paths without linking vendor libraries
+cmake ... -DDUCKBOOST_WITH_XGBOOST=ON -DDUCKBOOST_NATIVE_STUB_ONLY=ON
+# Or link a real install (bridge still pending):
+cmake ... -DDUCKBOOST_WITH_XGBOOST=ON -DXGBOOST_ROOT=/path/to/xgboost
+```
+
+Inspect the active build:
+
+```sql
+SELECT * FROM duckboost_build_info();
+SELECT * FROM duckboost_backends();
 ```
 
 Then:
@@ -24,6 +44,8 @@ Then:
 ```bash
 build/reldebug/test/unittest test/sql/duckboost/*
 ```
+
+See [`PACKAGING.md`](PACKAGING.md) for community / out-of-tree extraction.
 
 ## SQL API
 
@@ -88,7 +110,7 @@ SELECT duckboost_predict(model, features), duckboost_predict_proba(model, featur
 | `lightgbm` | Optional (`DUCKBOOST_WITH_LIGHTGBM`) | `booster_.save_model()` text | Yes |
 | `catboost` | Optional (`DUCKBOOST_WITH_CATBOOST`) | `save_model(..., format='json')` float trees | Yes |
 
-Native XGBoost / LightGBM / CatBoost linking is intentionally opt-in. Prefer training outside DuckDB and importing dumps when you need production booster quality.
+Native XGBoost / LightGBM / CatBoost linking is intentionally opt-in via `DUCKBOOST_WITH_*`. Until the vendor C API bridges land, those flags only compile stub entry points; prefer `duckboost_import()` for production boosters and `backend='reference'` for in-process experiments.
 
 ### Dump import notes
 
@@ -128,5 +150,7 @@ For `task: "multiclass"`, `n_classes >= 2`, optional `base_scores` holds per-cla
 
 ## Roadmap
 
-- Native trainers behind `DUCKBOOST_WITH_*` CMake options
-- Community extension packaging
+- [x] Native trainer scaffolding behind `DUCKBOOST_WITH_*` / `DUCKBOOST_NATIVE_STUB_ONLY` + `duckboost_build_info()`
+- [x] Community packaging docs (`PACKAGING.md`, local `extension_config.cmake`)
+- [ ] Vendor C API bridges (train → dump → import into `BoostModel`)
+- [ ] Publish as a DuckDB community extension

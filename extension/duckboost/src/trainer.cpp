@@ -1,4 +1,5 @@
 #include "duckboost/model.hpp"
+#include "duckboost/native_train.hpp"
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/numeric_utils.hpp"
@@ -378,14 +379,18 @@ BoostModel TrainReference(const vector<double> &y, const vector<vector<double>> 
 } // namespace
 
 BoostModel TrainModel(const vector<double> &y, const vector<vector<double>> &x, const TrainOptions &options) {
-	if (!BackendTrainingSupported(options.backend)) {
-		throw NotImplementedException(
-		    "duckboost: native training for backend '%s' is not linked in this build. "
-		    "Use backend='reference' to train in-process, or duckboost_import() with a duckboost JSON model. "
-		    "Optional CMake flags: DUCKBOOST_WITH_XGBOOST / DUCKBOOST_WITH_LIGHTGBM / DUCKBOOST_WITH_CATBOOST.",
-		    BackendToString(options.backend));
+	if (options.backend == BoostBackend::REFERENCE) {
+		return TrainReference(y, x, options);
 	}
-	return TrainReference(y, x, options);
+	if (NativeTrainerCompiled(options.backend)) {
+		return TrainNative(y, x, options);
+	}
+	throw NotImplementedException(
+	    "duckboost: native training for backend '%s' is not linked in this build. "
+	    "Use backend='reference' to train in-process, or duckboost_import() with a vendor dump. "
+	    "Optional CMake flags: DUCKBOOST_WITH_XGBOOST / DUCKBOOST_WITH_LIGHTGBM / DUCKBOOST_WITH_CATBOOST "
+	    "(add DUCKBOOST_NATIVE_STUB_ONLY=ON to compile stubs without vendor libs).",
+	    BackendToString(options.backend));
 }
 
 double EvaluateModel(const BoostModel &model, const vector<double> &y, const vector<vector<double>> &x,

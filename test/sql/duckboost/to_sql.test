@@ -57,8 +57,11 @@ SELECT q ILIKE '%tree_0%' AND q ILIKE '%_duckboost_trees%' FROM sql_text;
 true
 
 statement ok
+SET VARIABLE duckboost_sql = (SELECT q FROM sql_text);
+
+statement ok
 CREATE TABLE sql_pred AS
-SELECT * FROM query((SELECT q FROM sql_text));
+SELECT * FROM query(getvariable('duckboost_sql'));
 
 # Max absolute difference between native predict and SQL export should be tiny
 query I

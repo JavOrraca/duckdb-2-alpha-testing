@@ -66,7 +66,12 @@ SELECT * FROM query(getvariable('duckboost_sql'));
 # Max absolute difference between native predict and SQL export should be tiny
 query I
 SELECT max(abs(n.pred - s.pred)) < 1e-8
-FROM native_pred n, sql_pred s;
+FROM (
+	SELECT pred, row_number() OVER (ORDER BY x1, x2) AS rn FROM native_pred
+) n
+JOIN (
+	SELECT pred, row_number() OVER () AS rn FROM sql_pred
+) s USING (rn);
 ----
 true
 

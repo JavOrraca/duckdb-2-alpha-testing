@@ -192,9 +192,9 @@ void TrainCombine(Vector &source, Vector &target, AggregateInputData &, idx_t co
 }
 
 void TrainFinalize(Vector &state_vector, AggregateFinalizeInputData &, Vector &result, idx_t count, idx_t offset) {
-	if (state_vector.GetVectorType() == VectorType::CONSTANT_VECTOR) {
-		result.SetVectorType(VectorType::CONSTANT_VECTOR);
-	}
+	// FlatVector::Writer requires a flat result; leave result flat even when state is constant
+	// (ungrouped aggregates pass a constant state vector).
+	result.SetVectorType(VectorType::FLAT_VECTOR);
 	UnifiedVectorFormat state_format;
 	state_vector.ToUnifiedFormat(count, state_format);
 	auto states = UnifiedVectorFormat::GetData<TrainState *>(state_format);
@@ -388,6 +388,8 @@ void EvaluateAggCombine(Vector &source, Vector &target, AggregateInputData &, id
 
 void EvaluateAggFinalize(Vector &state_vector, AggregateFinalizeInputData &, Vector &result, idx_t count,
                          idx_t offset) {
+	// FlatVector::Writer requires a flat result; leave result flat even when state is constant.
+	result.SetVectorType(VectorType::FLAT_VECTOR);
 	UnifiedVectorFormat state_format;
 	state_vector.ToUnifiedFormat(count, state_format);
 	auto states = UnifiedVectorFormat::GetData<EvaluateAggState *>(state_format);

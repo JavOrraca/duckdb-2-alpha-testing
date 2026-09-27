@@ -5,7 +5,9 @@
 #include "duckdb/common/string_util.hpp"
 
 #include <cmath>
+#include <cstdint>
 #include <sstream>
+#include <unordered_map>
 
 namespace duckdb {
 namespace duckboost {
@@ -30,7 +32,71 @@ string TreeToSQL(const BoostTree &tree, const vector<string> &feature_columns, i
 	auto feature = QuoteIdent(feature_columns[node.feature]);
 	auto left = TreeToSQL(tree, feature_columns, node.left);
 	auto right = TreeToSQL(tree, feature_columns, node.right);
+	if (node.compare == SplitCompare::EQUAL) {
+		// OneHot True (equal) → right; keep THEN/ELSE matching EvalTree.
+		return "CASE WHEN " + feature + " = " + FormatDouble(node.threshold) + " THEN " + right + " ELSE " + left +
+		       " END";
+	}
 	return "CASE WHEN " + feature + " < " + FormatDouble(node.threshold) + " THEN " + left + " ELSE " + right + " END";
+}
+
+static constexpr uint64_t CTR_MAGIC_MULT = 0x4906ba494954cb65ULL;
+
+uint64_t FeatureHashU64(double value) {
+	// CatBoost passes CityHash as signed/unsigned 32-bit; preserve bit pattern via int32.
+	auto as_i = static_cast<int64_t>(std::llround(value));
+	return static_cast<uint64_t>(static_cast<uint32_t>(static_cast<int32_t>(as_i)));
+}
+
+uint64_t CombineCtrHash(const vector<idx_t> &cat_indices, const vector<double> &features) {
+	uint64_t hash = 0;
+	for (auto idx : cat_indices) {
+		if (idx >= features.size()) {
+			throw InvalidInputException("duckboost: CTR cat feature index out of range");
+		}
+		auto value = FeatureHashU64(features[idx]);
+		hash = CTR_MAGIC_MULT * (hash + CTR_MAGIC_MULT * value);
+	}
+	return hash;
+}
+
+double EvaluateCtrValue(const CtrFeatureSpec &ctr, const vector<double> &features) {
+	auto key = CombineCtrHash(ctr.cat_feature_indices, features);
+	unordered_map<uint64_t, idx_t> lookup;
+	lookup.reserve(ctr.hash_keys.size());
+	for (idx_t i = 0; i < ctr.hash_keys.size(); i++) {
+		lookup[ctr.hash_keys[i]] = i;
+	}
+	auto it = lookup.find(key);
+	auto type = StringUtil::Lower(ctr.ctr_type);
+	if (type == "counter" || type == "featurefreq" || type == "freq") {
+		int64_t count = 0;
+		if (it != lookup.end()) {
+			count = ctr.hash_values[it->second];
+		}
+		auto denom = static_cast<double>(ctr.counter_denominator) + ctr.prior_denominator;
+		if (denom == 0) {
+			return ctr.shift;
+		}
+		return ctr.shift + ctr.scale * ((ctr.prior_numerator + static_cast<double>(count)) / denom);
+	}
+	if (type == "borders" || type == "buckets" || type == "border") {
+		int64_t failures = 0;
+		int64_t successes = 0;
+		if (it != lookup.end()) {
+			failures = ctr.hash_values[it->second];
+			if (it->second < ctr.hash_values_alt.size()) {
+				successes = ctr.hash_values_alt[it->second];
+			}
+		}
+		auto denom = ctr.prior_numerator + static_cast<double>(successes) + ctr.prior_denominator +
+		             static_cast<double>(failures);
+		if (denom == 0) {
+			return ctr.shift;
+		}
+		return ctr.shift + ctr.scale * ((ctr.prior_numerator + static_cast<double>(successes)) / denom);
+	}
+	throw NotImplementedException("duckboost: unsupported CTR type '%s'", ctr.ctr_type);
 }
 
 double Sigmoid(double x) {
@@ -237,11 +303,64 @@ string BoostModel::ToJSON() const {
 			out << ",\"left\":" << node.left;
 			out << ",\"right\":" << node.right;
 			out << ",\"value\":" << FormatDouble(node.value);
+			if (node.compare == SplitCompare::EQUAL) {
+				out << ",\"compare\":\"equal\"";
+			}
 			out << '}';
 		}
 		out << "]}";
 	}
-	out << "]}";
+	out << ']';
+	if (n_raw_features > 0 || !ctr_features.empty()) {
+		out << ",\"n_raw_features\":" << (n_raw_features > 0 ? n_raw_features : n_features);
+	}
+	if (!ctr_features.empty()) {
+		out << ",\"ctr_features\":[";
+		for (idx_t c = 0; c < ctr_features.size(); c++) {
+			if (c > 0) {
+				out << ',';
+			}
+			auto &ctr = ctr_features[c];
+			out << "{\"feature_index\":" << ctr.feature_index;
+			out << ",\"ctr_type\":\"" << EscapeJSON(ctr.ctr_type) << "\"";
+			out << ",\"prior_numerator\":" << FormatDouble(ctr.prior_numerator);
+			out << ",\"prior_denominator\":" << FormatDouble(ctr.prior_denominator);
+			out << ",\"scale\":" << FormatDouble(ctr.scale);
+			out << ",\"shift\":" << FormatDouble(ctr.shift);
+			out << ",\"counter_denominator\":" << ctr.counter_denominator;
+			out << ",\"cat_feature_indices\":[";
+			for (idx_t i = 0; i < ctr.cat_feature_indices.size(); i++) {
+				if (i > 0) {
+					out << ',';
+				}
+				out << ctr.cat_feature_indices[i];
+			}
+			out << "],\"hash_keys\":[";
+			for (idx_t i = 0; i < ctr.hash_keys.size(); i++) {
+				if (i > 0) {
+					out << ',';
+				}
+				out << '"' << std::to_string(ctr.hash_keys[i]) << '"';
+			}
+			out << "],\"hash_values\":[";
+			for (idx_t i = 0; i < ctr.hash_values.size(); i++) {
+				if (i > 0) {
+					out << ',';
+				}
+				out << ctr.hash_values[i];
+			}
+			out << "],\"hash_values_alt\":[";
+			for (idx_t i = 0; i < ctr.hash_values_alt.size(); i++) {
+				if (i > 0) {
+					out << ',';
+				}
+				out << ctr.hash_values_alt[i];
+			}
+			out << "]}";
+		}
+		out << ']';
+	}
+	out << '}';
 	return out.str();
 }
 
@@ -342,6 +461,10 @@ BoostModel BoostModel::FromJSON(const string &json) {
 								node.right = static_cast<idx_t>(p.ParseNumber());
 							} else if (node_key == "value") {
 								node.value = p.ParseNumber();
+							} else if (node_key == "compare") {
+								auto cmp = StringUtil::Lower(p.ParseString());
+								node.compare = (cmp == "equal" || cmp == "eq" || cmp == "==") ? SplitCompare::EQUAL
+								                                                             : SplitCompare::LESS;
 							} else {
 								p.SkipValue();
 							}
@@ -354,12 +477,99 @@ BoostModel BoostModel::FromJSON(const string &json) {
 				}
 				model.trees.push_back(std::move(tree));
 			}
+		} else if (key == "n_raw_features") {
+			model.n_raw_features = static_cast<idx_t>(p.ParseNumber());
+		} else if (key == "ctr_features") {
+			p.Expect('[');
+			bool first_ctr = true;
+			while (!p.TryConsume(']')) {
+				if (!first_ctr) {
+					p.Expect(',');
+				}
+				first_ctr = false;
+				p.Expect('{');
+				CtrFeatureSpec ctr;
+				bool first_field = true;
+				while (!p.TryConsume('}')) {
+					if (!first_field) {
+						p.Expect(',');
+					}
+					first_field = false;
+					auto ck = p.ParseString();
+					p.Expect(':');
+					if (ck == "feature_index") {
+						ctr.feature_index = static_cast<idx_t>(p.ParseNumber());
+					} else if (ck == "ctr_type") {
+						ctr.ctr_type = p.ParseString();
+					} else if (ck == "prior_numerator") {
+						ctr.prior_numerator = p.ParseNumber();
+					} else if (ck == "prior_denominator") {
+						ctr.prior_denominator = p.ParseNumber();
+					} else if (ck == "scale") {
+						ctr.scale = p.ParseNumber();
+					} else if (ck == "shift") {
+						ctr.shift = p.ParseNumber();
+					} else if (ck == "counter_denominator") {
+						ctr.counter_denominator = static_cast<int64_t>(p.ParseNumber());
+					} else if (ck == "cat_feature_indices") {
+						p.Expect('[');
+						bool first_idx = true;
+						while (!p.TryConsume(']')) {
+							if (!first_idx) {
+								p.Expect(',');
+							}
+							first_idx = false;
+							ctr.cat_feature_indices.push_back(static_cast<idx_t>(p.ParseNumber()));
+						}
+					} else if (ck == "hash_keys") {
+						p.Expect('[');
+						bool first_key = true;
+						while (!p.TryConsume(']')) {
+							if (!first_key) {
+								p.Expect(',');
+							}
+							first_key = false;
+							if (p.Peek() == '"') {
+								ctr.hash_keys.push_back(std::stoull(p.ParseString()));
+							} else {
+								ctr.hash_keys.push_back(static_cast<uint64_t>(p.ParseNumber()));
+							}
+						}
+					} else if (ck == "hash_values") {
+						p.Expect('[');
+						bool first_val = true;
+						while (!p.TryConsume(']')) {
+							if (!first_val) {
+								p.Expect(',');
+							}
+							first_val = false;
+							ctr.hash_values.push_back(static_cast<int64_t>(p.ParseNumber()));
+						}
+					} else if (ck == "hash_values_alt") {
+						p.Expect('[');
+						bool first_val = true;
+						while (!p.TryConsume(']')) {
+							if (!first_val) {
+								p.Expect(',');
+							}
+							first_val = false;
+							ctr.hash_values_alt.push_back(static_cast<int64_t>(p.ParseNumber()));
+						}
+					} else {
+						p.SkipValue();
+					}
+				}
+				model.ctr_features.push_back(std::move(ctr));
+			}
 		} else {
 			p.SkipValue();
 		}
 	}
 	if (model.n_features == 0 && !model.feature_names.empty()) {
 		model.n_features = model.feature_names.size();
+	}
+	if (model.n_raw_features == 0) {
+		model.n_raw_features = model.n_features;
 	}
 	if (model.task == BoostTask::MULTICLASS) {
 		if (model.n_classes < 2) {
@@ -378,6 +588,28 @@ double BoostModel::ClassBias(idx_t class_idx) const {
 	return base_score;
 }
 
+vector<double> BoostModel::MaterializeFeatures(const vector<double> &features) const {
+	auto required_raw = n_raw_features > 0 ? n_raw_features : n_features;
+	if (!ctr_features.empty()) {
+		required_raw = n_raw_features > 0 ? n_raw_features : required_raw;
+	}
+	if (features.size() < required_raw) {
+		throw InvalidInputException("duckboost: expected at least %llu features, got %llu",
+		                            (unsigned long long)required_raw, (unsigned long long)features.size());
+	}
+	vector<double> materialized = features;
+	if (materialized.size() < n_features) {
+		materialized.resize(n_features, 0);
+	}
+	for (auto &ctr : ctr_features) {
+		if (ctr.feature_index >= materialized.size()) {
+			materialized.resize(ctr.feature_index + 1, 0);
+		}
+		materialized[ctr.feature_index] = EvaluateCtrValue(ctr, features);
+	}
+	return materialized;
+}
+
 double BoostModel::EvalTree(const BoostTree &tree, const vector<double> &features) const {
 	idx_t node_idx = 0;
 	while (true) {
@@ -391,7 +623,11 @@ double BoostModel::EvalTree(const BoostTree &tree, const vector<double> &feature
 		if (node.feature >= features.size()) {
 			throw InvalidInputException("duckboost: feature index out of range during prediction");
 		}
-		node_idx = features[node.feature] < node.threshold ? node.left : node.right;
+		if (node.compare == SplitCompare::EQUAL) {
+			node_idx = features[node.feature] == node.threshold ? node.right : node.left;
+		} else {
+			node_idx = features[node.feature] < node.threshold ? node.left : node.right;
+		}
 	}
 }
 
@@ -399,24 +635,22 @@ double BoostModel::PredictRaw(const vector<double> &features) const {
 	if (task == BoostTask::MULTICLASS) {
 		throw InvalidInputException("duckboost: PredictRaw is not defined for multiclass; use Predict / PredictProba");
 	}
-	if (features.size() < n_features) {
-		throw InvalidInputException("duckboost: expected at least %llu features, got %llu",
-		                            (unsigned long long)n_features, (unsigned long long)features.size());
-	}
+	auto feats = MaterializeFeatures(features);
 	double score = ClassBias(0);
 	for (auto &tree : trees) {
-		score += learning_rate * EvalTree(tree, features);
+		score += learning_rate * EvalTree(tree, feats);
 	}
 	return score;
 }
 
 vector<double> BoostModel::PredictRawMulti(const vector<double> &features) const {
-	if (features.size() < n_features) {
-		throw InvalidInputException("duckboost: expected at least %llu features, got %llu",
-		                            (unsigned long long)n_features, (unsigned long long)features.size());
-	}
+	auto feats = MaterializeFeatures(features);
 	if (task != BoostTask::MULTICLASS) {
-		return {PredictRaw(features)};
+		double score = ClassBias(0);
+		for (auto &tree : trees) {
+			score += learning_rate * EvalTree(tree, feats);
+		}
+		return {score};
 	}
 	if (n_classes < 2) {
 		throw InvalidInputException("duckboost: multiclass model requires n_classes >= 2");
@@ -432,7 +666,7 @@ vector<double> BoostModel::PredictRawMulti(const vector<double> &features) const
 	const idx_t n_rounds = trees.size() / n_classes;
 	for (idx_t round = 0; round < n_rounds; round++) {
 		for (idx_t c = 0; c < n_classes; c++) {
-			scores[c] += learning_rate * EvalTree(trees[round * n_classes + c], features);
+			scores[c] += learning_rate * EvalTree(trees[round * n_classes + c], feats);
 		}
 	}
 	return scores;
@@ -487,6 +721,10 @@ string ExportModelSQL(const BoostModel &model, const string &table_name, const v
                       const SqlExportOptions &options) {
 	if (table_name.empty()) {
 		throw InvalidInputException("duckboost: table_name must not be empty");
+	}
+	if (!model.ctr_features.empty()) {
+		throw NotImplementedException(
+		    "duckboost: duckboost_to_sql does not support CatBoost OnlineCtr models yet; use duckboost_predict");
 	}
 	vector<string> columns = feature_columns;
 	if (columns.empty()) {

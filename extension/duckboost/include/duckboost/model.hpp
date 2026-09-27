@@ -21,6 +21,9 @@ enum class BoostBackend : uint8_t { REFERENCE = 0, XGBOOST = 1, LIGHTGBM = 2, CA
 
 enum class BoostTask : uint8_t { REGRESSION = 0, BINARY = 1, MULTICLASS = 2 };
 
+//! LESS: feature < threshold → left (default). EQUAL: feature == threshold → right (CatBoost OneHot).
+enum class SplitCompare : uint8_t { LESS = 0, EQUAL = 1 };
+
 struct TreeNode {
 	idx_t feature = 0;
 	double threshold = 0;
@@ -28,10 +31,28 @@ struct TreeNode {
 	idx_t right = 0;
 	double value = 0;
 	bool is_leaf = true;
+	SplitCompare compare = SplitCompare::LESS;
 };
 
 struct BoostTree {
 	vector<TreeNode> nodes;
+};
+
+//! CatBoost OnlineCtr feature evaluated at predict time into a synthetic feature slot.
+struct CtrFeatureSpec {
+	idx_t feature_index = 0;
+	string ctr_type = "Counter";
+	double prior_numerator = 0;
+	double prior_denominator = 1;
+	double scale = 1;
+	double shift = 0;
+	int64_t counter_denominator = 0;
+	//! Flat feature indices of categorical hashes (CityHash already applied by caller).
+	vector<idx_t> cat_feature_indices;
+	//! Counter: hash → count. Borders: hash → (failures, successes) packed as pair in parallel maps.
+	vector<uint64_t> hash_keys;
+	vector<int64_t> hash_values;     // Counter counts, or Borders failures
+	vector<int64_t> hash_values_alt; // Borders successes (empty for Counter)
 };
 
 struct BoostModel {
@@ -43,16 +64,20 @@ struct BoostModel {
 	vector<double> base_scores;
 	double learning_rate = 0.1;
 	idx_t n_features = 0;
+	//! Number of caller-supplied features before synthetic CTR slots.
+	idx_t n_raw_features = 0;
 	//! 1 for regression/binary; >= 2 for multiclass.
 	idx_t n_classes = 1;
 	vector<string> feature_names;
 	//! For multiclass: trees laid out as [round][class] → index round * n_classes + class.
 	vector<BoostTree> trees;
+	vector<CtrFeatureSpec> ctr_features;
 
 	string ToJSON() const;
 	static BoostModel FromJSON(const string &json);
 
 	double ClassBias(idx_t class_idx) const;
+	vector<double> MaterializeFeatures(const vector<double> &features) const;
 	double EvalTree(const BoostTree &tree, const vector<double> &features) const;
 	double PredictRaw(const vector<double> &features) const;
 	vector<double> PredictRawMulti(const vector<double> &features) const;

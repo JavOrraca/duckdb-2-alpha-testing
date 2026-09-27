@@ -3,9 +3,11 @@
 
 #include "duckdb/common/numeric_utils.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/common/unordered_map.hpp"
 
 #include <cctype>
 #include <cmath>
+#include <cstdint>
 #include <limits>
 #include <map>
 #include <sstream>
@@ -256,7 +258,7 @@ idx_t ConvertLGBNode(idx_t internal_idx, const vector<int64_t> &split_feature, c
 }
 
 idx_t ExpandCatBoost(idx_t depth, idx_t path_bits, const vector<idx_t> &features, const vector<double> &thresholds,
-                     const vector<double> &leaf_values, BoostTree &tree) {
+                     const vector<SplitCompare> &compares, const vector<double> &leaf_values, BoostTree &tree) {
 	if (depth == features.size()) {
 		if (path_bits >= leaf_values.size()) {
 			throw InvalidInputException("duckboost: catboost leaf index out of range");
@@ -271,13 +273,25 @@ idx_t ExpandCatBoost(idx_t depth, idx_t path_bits, const vector<idx_t> &features
 	node.is_leaf = false;
 	node.feature = features[depth];
 	node.threshold = thresholds[depth];
+	node.compare = compares[depth];
 	auto idx = tree.nodes.size();
 	tree.nodes.push_back(node);
-	// False (feature <= border) → left / bit 0; True (feature > border) → right / bit 1
-	tree.nodes[idx].left = ExpandCatBoost(depth + 1, path_bits << 1, features, thresholds, leaf_values, tree);
-	tree.nodes[idx].right = ExpandCatBoost(depth + 1, (path_bits << 1) | 1, features, thresholds, leaf_values, tree);
+	// False → left / bit 0; True → right / bit 1
+	tree.nodes[idx].left =
+	    ExpandCatBoost(depth + 1, path_bits << 1, features, thresholds, compares, leaf_values, tree);
+	tree.nodes[idx].right =
+	    ExpandCatBoost(depth + 1, (path_bits << 1) | 1, features, thresholds, compares, leaf_values, tree);
 	return idx;
 }
+
+enum class CatSplitKind : uint8_t { FLOAT = 0, ONE_HOT = 1, CTR = 2 };
+
+struct GlobalCatSplit {
+	CatSplitKind kind = CatSplitKind::FLOAT;
+	idx_t feature = 0;
+	double border_or_value = 0;
+	idx_t ctr_index = 0; // index into features_info.ctrs / model.ctr_features
+};
 
 } // namespace
 
@@ -469,8 +483,27 @@ BoostModel ImportCatBoostJSON(const string &dump, const ImportOptions &options) 
 		idx_t flat_feature_index = 0;
 		vector<double> borders;
 	};
+	struct CatFeatureInfo {
+		idx_t feature_index = 0;
+		idx_t flat_feature_index = 0;
+		vector<double> one_hot_values;
+	};
+	struct CtrInfo {
+		string ctr_type = "Counter";
+		string identifier;
+		double prior_numerator = 0;
+		double prior_denominator = 1;
+		double scale = 1;
+		double shift = 0;
+		vector<double> borders;
+		vector<idx_t> cat_flat_indices;
+		bool cats_only = true;
+	};
+
 	vector<FloatFeatureInfo> float_features;
-	vector<std::pair<idx_t, double>> global_splits; // split_index → (feature, border)
+	vector<CatFeatureInfo> cat_features;
+	vector<CtrInfo> ctr_infos;
+	unordered_map<string, CtrFeatureSpec> ctr_data_by_id;
 	double scale = 1.0;
 	vector<double> biases = {0.0};
 	bool has_trees = false;
@@ -479,8 +512,12 @@ BoostModel ImportCatBoostJSON(const string &dump, const ImportOptions &options) 
 	struct TreeSplit {
 		idx_t feature = 0;
 		double border = 0;
+		SplitCompare compare = SplitCompare::LESS;
+		CatSplitKind kind = CatSplitKind::FLOAT;
+		idx_t ctr_index = 0;
 		bool resolved = false;
 		idx_t split_index = 0;
+		string split_type = "FloatFeature";
 	};
 	struct PendingTree {
 		vector<double> leaf_values;
@@ -506,57 +543,268 @@ BoostModel ImportCatBoostJSON(const string &dump, const ImportOptions &options) 
 				first_fi = false;
 				auto fi_key = p.ParseString();
 				p.Expect(':');
-				if (fi_key != "float_features") {
-					p.SkipValue();
-					continue;
-				}
-				p.Expect('[');
-				bool first_feat = true;
-				while (!p.TryConsume(']')) {
-					if (!first_feat) {
-						p.Expect(',');
-					}
-					first_feat = false;
-					p.Expect('{');
-					FloatFeatureInfo feat;
-					bool has_feature_index = false;
-					bool has_flat = false;
-					bool first_field = true;
-					while (!p.TryConsume('}')) {
-						if (!first_field) {
+				if (fi_key == "float_features") {
+					p.Expect('[');
+					bool first_feat = true;
+					while (!p.TryConsume(']')) {
+						if (!first_feat) {
 							p.Expect(',');
 						}
-						first_field = false;
-						auto fkey = p.ParseString();
-						p.Expect(':');
-						if (fkey == "feature_index") {
-							feat.feature_index = static_cast<idx_t>(p.ParseNumber());
-							has_feature_index = true;
-						} else if (fkey == "flat_feature_index") {
-							feat.flat_feature_index = static_cast<idx_t>(p.ParseNumber());
-							has_flat = true;
-						} else if (fkey == "borders") {
-							p.Expect('[');
-							bool first_border = true;
-							while (!p.TryConsume(']')) {
-								if (!first_border) {
-									p.Expect(',');
-								}
-								first_border = false;
-								feat.borders.push_back(p.ParseNumber());
+						first_feat = false;
+						p.Expect('{');
+						FloatFeatureInfo feat;
+						bool has_feature_index = false;
+						bool has_flat = false;
+						bool first_field = true;
+						while (!p.TryConsume('}')) {
+							if (!first_field) {
+								p.Expect(',');
 							}
-						} else {
-							p.SkipValue();
+							first_field = false;
+							auto fkey = p.ParseString();
+							p.Expect(':');
+							if (fkey == "feature_index") {
+								feat.feature_index = static_cast<idx_t>(p.ParseNumber());
+								has_feature_index = true;
+							} else if (fkey == "flat_feature_index") {
+								feat.flat_feature_index = static_cast<idx_t>(p.ParseNumber());
+								has_flat = true;
+							} else if (fkey == "borders") {
+								p.Expect('[');
+								bool first_border = true;
+								while (!p.TryConsume(']')) {
+									if (!first_border) {
+										p.Expect(',');
+									}
+									first_border = false;
+									feat.borders.push_back(p.ParseNumber());
+								}
+							} else {
+								p.SkipValue();
+							}
 						}
+						if (!has_flat && has_feature_index) {
+							feat.flat_feature_index = feat.feature_index;
+						}
+						if (!has_feature_index && has_flat) {
+							feat.feature_index = feat.flat_feature_index;
+						}
+						float_features.push_back(std::move(feat));
 					}
-					if (!has_flat && has_feature_index) {
-						feat.flat_feature_index = feat.feature_index;
+				} else if (fi_key == "categorical_features") {
+					p.Expect('[');
+					bool first_feat = true;
+					while (!p.TryConsume(']')) {
+						if (!first_feat) {
+							p.Expect(',');
+						}
+						first_feat = false;
+						p.Expect('{');
+						CatFeatureInfo feat;
+						bool has_feature_index = false;
+						bool has_flat = false;
+						bool first_field = true;
+						while (!p.TryConsume('}')) {
+							if (!first_field) {
+								p.Expect(',');
+							}
+							first_field = false;
+							auto fkey = p.ParseString();
+							p.Expect(':');
+							if (fkey == "feature_index") {
+								feat.feature_index = static_cast<idx_t>(p.ParseNumber());
+								has_feature_index = true;
+							} else if (fkey == "flat_feature_index") {
+								feat.flat_feature_index = static_cast<idx_t>(p.ParseNumber());
+								has_flat = true;
+							} else if (fkey == "values") {
+								p.Expect('[');
+								bool first_val = true;
+								while (!p.TryConsume(']')) {
+									if (!first_val) {
+										p.Expect(',');
+									}
+									first_val = false;
+									feat.one_hot_values.push_back(p.ParseNumber());
+								}
+							} else {
+								p.SkipValue();
+							}
+						}
+						if (!has_flat && has_feature_index) {
+							feat.flat_feature_index = feat.feature_index;
+						}
+						if (!has_feature_index && has_flat) {
+							feat.feature_index = feat.flat_feature_index;
+						}
+						cat_features.push_back(std::move(feat));
 					}
-					if (!has_feature_index && has_flat) {
-						feat.feature_index = feat.flat_feature_index;
+				} else if (fi_key == "ctrs") {
+					p.Expect('[');
+					bool first_ctr = true;
+					while (!p.TryConsume(']')) {
+						if (!first_ctr) {
+							p.Expect(',');
+						}
+						first_ctr = false;
+						p.Expect('{');
+						CtrInfo ctr;
+						bool first_field = true;
+						while (!p.TryConsume('}')) {
+							if (!first_field) {
+								p.Expect(',');
+							}
+							first_field = false;
+							auto ckey = p.ParseString();
+							p.Expect(':');
+							if (ckey == "ctr_type" || ckey == "type") {
+								ctr.ctr_type = p.ParseString();
+							} else if (ckey == "identifier") {
+								ctr.identifier = p.ParseString();
+							} else if (ckey == "prior_numerator") {
+								ctr.prior_numerator = p.ParseNumber();
+							} else if (ckey == "prior_denomerator" || ckey == "prior_denominator") {
+								ctr.prior_denominator = p.ParseNumber();
+							} else if (ckey == "scale") {
+								ctr.scale = p.ParseNumber();
+							} else if (ckey == "shift") {
+								ctr.shift = p.ParseNumber();
+							} else if (ckey == "borders") {
+								p.Expect('[');
+								bool first_border = true;
+								while (!p.TryConsume(']')) {
+									if (!first_border) {
+										p.Expect(',');
+									}
+									first_border = false;
+									ctr.borders.push_back(p.ParseNumber());
+								}
+							} else if (ckey == "elements") {
+								p.Expect('[');
+								bool first_el = true;
+								while (!p.TryConsume(']')) {
+									if (!first_el) {
+										p.Expect(',');
+									}
+									first_el = false;
+									p.Expect('{');
+									idx_t cat_idx = 0;
+									string element_type;
+									bool first_efield = true;
+									while (!p.TryConsume('}')) {
+										if (!first_efield) {
+											p.Expect(',');
+										}
+										first_efield = false;
+										auto ekey = p.ParseString();
+										p.Expect(':');
+										if (ekey == "combination_element") {
+											element_type = p.ParseString();
+										} else if (ekey == "cat_feature_index") {
+											cat_idx = static_cast<idx_t>(p.ParseNumber());
+										} else {
+											p.SkipValue();
+										}
+									}
+									if (element_type == "cat_feature_value") {
+										ctr.cat_flat_indices.push_back(cat_idx); // remapped later
+									} else {
+										ctr.cats_only = false;
+									}
+								}
+							} else {
+								p.SkipValue();
+							}
+						}
+						ctr_infos.push_back(std::move(ctr));
 					}
-					float_features.push_back(std::move(feat));
+				} else {
+					p.SkipValue();
 				}
+			}
+		} else if (key == "ctr_data") {
+			p.Expect('{');
+			bool first_cd = true;
+			while (!p.TryConsume('}')) {
+				if (!first_cd) {
+					p.Expect(',');
+				}
+				first_cd = false;
+				auto identifier = p.ParseString();
+				p.Expect(':');
+				p.Expect('{');
+				CtrFeatureSpec spec;
+				spec.ctr_type = "Counter";
+				bool first_field = true;
+				while (!p.TryConsume('}')) {
+					if (!first_field) {
+						p.Expect(',');
+					}
+					first_field = false;
+					auto dkey = p.ParseString();
+					p.Expect(':');
+					if (dkey == "counter_denominator") {
+						spec.counter_denominator = static_cast<int64_t>(p.ParseNumber());
+					} else if (dkey == "hash_stride") {
+						p.ParseNumber();
+					} else if (dkey == "hash_map") {
+						p.Expect('[');
+						// Detect stride by checking identifier later; parse as flat list of numbers/strings.
+						vector<string> tokens;
+						bool first_tok = true;
+						while (!p.TryConsume(']')) {
+							if (!first_tok) {
+								p.Expect(',');
+							}
+							first_tok = false;
+							if (p.Peek() == '"') {
+								tokens.push_back(p.ParseString());
+							} else {
+								tokens.push_back(std::to_string(static_cast<int64_t>(p.ParseNumber())));
+							}
+						}
+						// Store raw tokens temporarily in hash_keys as 0 and values as sentinel via string side channel:
+						// We'll reinterpret after ctr_type is known; keep tokens in hash_values size as packed later.
+						// For now assume Counter stride=2 (key, count) unless Borders (key, fail, success).
+						// Parse as Counter by default; Borders rewrite when matched to ctr_infos.
+						for (idx_t i = 0; i + 1 < tokens.size();) {
+							spec.hash_keys.push_back(std::stoull(tokens[i]));
+							spec.hash_values.push_back(std::stoll(tokens[i + 1]));
+							if (i + 2 < tokens.size()) {
+								// peek: if next looks like another key (large) vs success count — deferred
+							}
+							i += 2;
+							// Keep alt empty for Counter; Borders fixed up below when identifier type known.
+							(void)i;
+						}
+						// Save full token list encoded: put stride hint in hash_values_alt[0] as token count.
+						spec.hash_values_alt.clear();
+						for (auto &tok : tokens) {
+							// reuse: store nothing; re-parse from keys/values only for Counter.
+							(void)tok;
+						}
+						// Re-parse with flexible stride based on identifier substring.
+						spec.hash_keys.clear();
+						spec.hash_values.clear();
+						spec.hash_values_alt.clear();
+						idx_t stride = 2;
+						auto id_lower = StringUtil::Lower(identifier);
+						if (id_lower.find("borders") != string::npos || id_lower.find("buckets") != string::npos) {
+							stride = 3;
+							spec.ctr_type = "Borders";
+						}
+						for (idx_t i = 0; i + stride - 1 < tokens.size(); i += stride) {
+							spec.hash_keys.push_back(std::stoull(tokens[i]));
+							spec.hash_values.push_back(std::stoll(tokens[i + 1]));
+							if (stride == 3) {
+								spec.hash_values_alt.push_back(std::stoll(tokens[i + 2]));
+							}
+						}
+					} else {
+						p.SkipValue();
+					}
+				}
+				ctr_data_by_id[identifier] = std::move(spec);
 			}
 		} else if (key == "oblivious_trees") {
 			has_trees = true;
@@ -599,6 +847,7 @@ BoostModel ImportCatBoostJSON(const string &dump, const ImportOptions &options) 
 							TreeSplit split;
 							bool has_border = false;
 							bool has_feature = false;
+							bool has_value = false;
 							bool first_sfield = true;
 							while (!p.TryConsume('}')) {
 								if (!first_sfield) {
@@ -612,21 +861,38 @@ BoostModel ImportCatBoostJSON(const string &dump, const ImportOptions &options) 
 								} else if (skey == "float_feature_index" || skey == "flat_feature_index") {
 									split.feature = static_cast<idx_t>(p.ParseNumber());
 									has_feature = true;
+								} else if (skey == "cat_feature_index") {
+									split.feature = static_cast<idx_t>(p.ParseNumber());
+									has_feature = true;
 								} else if (skey == "border") {
 									split.border = p.ParseNumber();
 									has_border = true;
+								} else if (skey == "value") {
+									split.border = p.ParseNumber();
+									has_value = true;
 								} else if (skey == "split_type") {
-									auto st = p.ParseString();
-									if (st != "FloatFeature") {
-										throw NotImplementedException(
-										    "duckboost: catboost split_type '%s' is not supported (FloatFeature only)",
-										    st);
-									}
+									split.split_type = p.ParseString();
 								} else {
 									p.SkipValue();
 								}
 							}
-							split.resolved = has_border && has_feature;
+							auto st = split.split_type;
+							if (st == "FloatFeature") {
+								split.kind = CatSplitKind::FLOAT;
+								split.compare = SplitCompare::LESS;
+								split.resolved = has_border && has_feature;
+							} else if (st == "OneHotFeature") {
+								split.kind = CatSplitKind::ONE_HOT;
+								split.compare = SplitCompare::EQUAL;
+								split.resolved = has_value && has_feature;
+							} else if (st == "OnlineCtr") {
+								split.kind = CatSplitKind::CTR;
+								split.compare = SplitCompare::LESS;
+								split.resolved = false; // always resolve via split_index / ctr tables
+							} else {
+								throw NotImplementedException(
+								    "duckboost: catboost split_type '%s' is not supported", st);
+							}
 							tree.splits.push_back(split);
 						}
 					} else {
@@ -705,34 +971,146 @@ BoostModel ImportCatBoostJSON(const string &dump, const ImportOptions &options) 
 		throw InvalidInputException("duckboost: catboost JSON missing oblivious_trees");
 	}
 
+	// Remap cat_feature_index → flat_feature_index for CTR elements.
+	for (auto &ctr : ctr_infos) {
+		for (auto &idx : ctr.cat_flat_indices) {
+			if (idx >= cat_features.size()) {
+				throw InvalidInputException("duckboost: catboost CTR cat_feature_index out of range");
+			}
+			idx = cat_features[idx].flat_feature_index;
+		}
+	}
+
+	vector<GlobalCatSplit> global_splits;
 	for (auto &feat : float_features) {
-		auto feature_id = feat.flat_feature_index;
-		model.n_features = MaxValue<idx_t>(model.n_features, feature_id + 1);
+		model.n_features = MaxValue<idx_t>(model.n_features, feat.flat_feature_index + 1);
 		for (auto border : feat.borders) {
-			global_splits.emplace_back(feature_id, border);
+			GlobalCatSplit split;
+			split.kind = CatSplitKind::FLOAT;
+			split.feature = feat.flat_feature_index;
+			split.border_or_value = border;
+			global_splits.push_back(split);
+		}
+	}
+	for (auto &feat : cat_features) {
+		model.n_features = MaxValue<idx_t>(model.n_features, feat.flat_feature_index + 1);
+		for (auto value : feat.one_hot_values) {
+			GlobalCatSplit split;
+			split.kind = CatSplitKind::ONE_HOT;
+			split.feature = feat.flat_feature_index;
+			split.border_or_value = value;
+			global_splits.push_back(split);
+		}
+	}
+
+	model.n_raw_features = model.n_features;
+	// Allocate synthetic CTR feature slots and append CTR borders to global split index.
+	for (idx_t ci = 0; ci < ctr_infos.size(); ci++) {
+		auto &ctr = ctr_infos[ci];
+		auto synth = model.n_features;
+		model.n_features = synth + 1;
+		CtrFeatureSpec spec;
+		spec.feature_index = synth;
+		spec.ctr_type = ctr.ctr_type;
+		spec.prior_numerator = ctr.prior_numerator;
+		spec.prior_denominator = ctr.prior_denominator;
+		spec.scale = ctr.scale;
+		spec.shift = ctr.shift;
+		spec.cat_feature_indices = ctr.cat_flat_indices;
+		if (!ctr.cats_only) {
+			throw NotImplementedException(
+			    "duckboost: CatBoost OnlineCtr with non-categorical combination elements is not supported yet");
+		}
+		if (!ctr.identifier.empty() && ctr_data_by_id.count(ctr.identifier)) {
+			auto &data = ctr_data_by_id[ctr.identifier];
+			spec.hash_keys = data.hash_keys;
+			spec.hash_values = data.hash_values;
+			spec.hash_values_alt = data.hash_values_alt;
+			spec.counter_denominator = data.counter_denominator;
+			if (!data.ctr_type.empty()) {
+				spec.ctr_type = data.ctr_type;
+			}
+		} else if (!ctr_data_by_id.empty()) {
+			// Try fuzzy match on ctr_type in identifier keys.
+			for (auto &entry : ctr_data_by_id) {
+				if (entry.first.find(ctr.ctr_type) != string::npos ||
+				    StringUtil::Lower(entry.first).find(StringUtil::Lower(ctr.ctr_type)) != string::npos) {
+					// Prefer exact identifier; skip fuzzy if identifier set.
+					if (ctr.identifier.empty()) {
+						spec.hash_keys = entry.second.hash_keys;
+						spec.hash_values = entry.second.hash_values;
+						spec.hash_values_alt = entry.second.hash_values_alt;
+						spec.counter_denominator = entry.second.counter_denominator;
+					}
+				}
+			}
+		}
+		model.ctr_features.push_back(spec);
+		for (auto border : ctr.borders) {
+			GlobalCatSplit split;
+			split.kind = CatSplitKind::CTR;
+			split.feature = synth;
+			split.border_or_value = border;
+			split.ctr_index = ci;
+			global_splits.push_back(split);
 		}
 	}
 
 	for (auto &pending : pending_trees) {
 		vector<idx_t> features;
 		vector<double> thresholds;
+		vector<SplitCompare> compares;
 		features.reserve(pending.splits.size());
 		thresholds.reserve(pending.splits.size());
+		compares.reserve(pending.splits.size());
 		for (auto &split : pending.splits) {
 			idx_t feature = split.feature;
 			double border = split.border;
-			if (!split.resolved) {
+			SplitCompare compare = split.compare;
+			if (split.kind == CatSplitKind::ONE_HOT && split.resolved) {
+				// Inline OneHot uses cat_feature_index; map to flat when possible.
+				if (feature < cat_features.size() &&
+				    cat_features[feature].feature_index == feature) {
+					feature = cat_features[feature].flat_feature_index;
+				} else {
+					for (auto &cf : cat_features) {
+						if (cf.feature_index == split.feature) {
+							feature = cf.flat_feature_index;
+							break;
+						}
+					}
+				}
+			} else if (!split.resolved || split.kind == CatSplitKind::CTR) {
 				if (split.split_index >= global_splits.size()) {
 					throw InvalidInputException("duckboost: catboost split_index %llu out of range",
 					                            (unsigned long long)split.split_index);
 				}
-				feature = global_splits[split.split_index].first;
-				border = global_splits[split.split_index].second;
+				auto &gs = global_splits[split.split_index];
+				feature = gs.feature;
+				border = gs.border_or_value;
+				if (gs.kind == CatSplitKind::ONE_HOT) {
+					compare = SplitCompare::EQUAL;
+				} else if (gs.kind == CatSplitKind::CTR) {
+					compare = SplitCompare::LESS;
+					if (gs.ctr_index >= model.ctr_features.size() ||
+					    model.ctr_features[gs.ctr_index].hash_keys.empty()) {
+						throw NotImplementedException(
+						    "duckboost: CatBoost OnlineCtr split requires ctr_data in the JSON dump "
+						    "(save_model with pool=...)");
+					}
+				} else {
+					compare = SplitCompare::LESS;
+				}
 			}
 			model.n_features = MaxValue<idx_t>(model.n_features, feature + 1);
 			features.push_back(feature);
-			// CatBoost True when feature > border; duckboost left uses feature < threshold.
-			thresholds.push_back(ThresholdForLessEqual(border));
+			if (compare == SplitCompare::EQUAL) {
+				thresholds.push_back(border);
+			} else {
+				// CatBoost True when feature > border; duckboost left uses feature < threshold.
+				thresholds.push_back(ThresholdForLessEqual(border));
+			}
+			compares.push_back(compare);
 		}
 		idx_t leaves_per_class = idx_t(1) << features.size();
 		if (leaves_per_class == 0 || pending.leaf_values.size() % leaves_per_class != 0) {
@@ -750,14 +1128,13 @@ BoostModel ImportCatBoostJSON(const string &dump, const ImportOptions &options) 
 			throw InvalidInputException("duckboost: catboost inconsistent class count across trees (%llu vs %llu)",
 			                            (unsigned long long)detected_classes, (unsigned long long)tree_classes);
 		}
-		// JSON layout: first 2^depth values for class 0, next for class 1, ...
 		for (idx_t c = 0; c < tree_classes; c++) {
 			vector<double> class_leaves(leaves_per_class);
 			for (idx_t leaf = 0; leaf < leaves_per_class; leaf++) {
 				class_leaves[leaf] = pending.leaf_values[c * leaves_per_class + leaf] * scale;
 			}
 			BoostTree tree;
-			ExpandCatBoost(0, 0, features, thresholds, class_leaves, tree);
+			ExpandCatBoost(0, 0, features, thresholds, compares, class_leaves, tree);
 			model.trees.push_back(std::move(tree));
 		}
 	}

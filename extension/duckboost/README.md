@@ -63,18 +63,30 @@ SELECT duckboost_to_sql(
 	['x1', 'x2'],
 	MAP {'separate_trees': 'true', 'prediction_alias': 'pred'}
 ) FROM models;
+
+-- Import a vendor dump trained outside DuckDB
+SELECT duckboost_import('xgboost', xgb_dump_json, MAP {'task': 'binary', 'base_score': '0.0'});
+SELECT duckboost_import('lightgbm', lgb_model_txt);
+SELECT duckboost_import('catboost', catboost_model_json);
 ```
 
 ### Backends
 
-| Backend | Train in this build | Predict / evaluate / `to_sql` |
-| --- | --- | --- |
-| `reference` | Yes (built-in GBDT) | Yes |
-| `xgboost` | Optional (`DUCKBOOST_WITH_XGBOOST`) | Via `duckboost_import` of duckboost JSON |
-| `lightgbm` | Optional (`DUCKBOOST_WITH_LIGHTGBM`) | Via `duckboost_import` |
-| `catboost` | Optional (`DUCKBOOST_WITH_CATBOOST`) | Via `duckboost_import` |
+| Backend | Train in this build | Dump import | Predict / evaluate / `to_sql` |
+| --- | --- | --- | --- |
+| `reference` | Yes (built-in GBDT) | duckboost JSON | Yes |
+| `xgboost` | Optional (`DUCKBOOST_WITH_XGBOOST`) | `dump_model(..., dump_format='json')` | Yes |
+| `lightgbm` | Optional (`DUCKBOOST_WITH_LIGHTGBM`) | `booster_.save_model()` text | Yes |
+| `catboost` | Optional (`DUCKBOOST_WITH_CATBOOST`) | `save_model(..., format='json')` float trees | Yes |
 
-Native XGBoost / LightGBM / CatBoost linking is intentionally opt-in so the extension builds without those heavyweight dependencies. The unified duckboost JSON model format is the interchange layer; adapters that convert vendor dumps into that format are the next integration step.
+Native XGBoost / LightGBM / CatBoost linking is intentionally opt-in. Prefer training outside DuckDB and importing dumps when you need production booster quality.
+
+### Dump import notes
+
+- Imported models set `learning_rate = 1.0` and bake vendor shrinkage/scale into leaf values (XGBoost dump leaves already include η; LightGBM `shrinkage` and CatBoost `scale_and_bias` are applied at import).
+- LightGBM numerical `<=` splits are converted to duckboost `<` via `nextafter(threshold, +∞)`.
+- CatBoost support is float/`FloatFeature` oblivious trees only (no OneHot/CTR/multiclass yet).
+- Optional import map keys: `task`, `base_score`, `learning_rate`, `feature_names`.
 
 ## Model format
 
@@ -102,7 +114,6 @@ Models are opaque `VARCHAR` JSON documents:
 ## Roadmap
 
 - Native trainers behind `DUCKBOOST_WITH_*` CMake options
-- Importers for XGBoost JSON / LightGBM text / CatBoost JSON dumps
-- Multiclass + ranking objectives
+- CatBoost OneHot/CTR + multiclass dump support
 - Model catalog table macros (`duckboost_fit`, `duckboost_score`)
 - Community extension packaging

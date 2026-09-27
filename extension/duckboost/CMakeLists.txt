@@ -8,6 +8,7 @@ set(DUCKBOOST_EXTENSION_FILES
     duckboost_extension.cpp
     src/model.cpp
     src/trainer.cpp
+    src/import.cpp
     src/duckboost_functions.cpp)
 
 build_extension_library(duckboost ${DUCKBOOST_EXTENSION_FILES})

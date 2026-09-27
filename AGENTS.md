@@ -491,3 +491,11 @@ This regenerates:
 - `extension/extension_config.cmake` - Extension configuration
 - `scripts/format.py` - Code formatter
 - `scripts/generate_*.py` - Code generation scripts
+
+## Cursor Cloud specific instructions
+
+The base image points `cc` and `c++` at Clang, and that Clang cannot link `libstdc++` (`cannot find -lstdc++`). Environment install switches both alternatives to GCC before `make reldebug`. Repeat that `update-alternatives` step if a later configure fails the same way.
+
+Keep `CMAKE_BUILD_PARALLEL_LEVEL=2` on the default Cloud Agent VM (4 vCPU, 16 GB). Unity compilation with more jobs can run out of memory.
+
+Install prebuilds the development tree at `build/reldebug` (Ninja + ccache). Use `build/reldebug/duckdb` for the shell and `build/reldebug/test/unittest` for tests. There is no long-running server to start.

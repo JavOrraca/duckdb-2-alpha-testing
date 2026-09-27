@@ -33,7 +33,7 @@ SELECT duckboost_predict(model, [2.0]) FROM mc_models;
 1.0
 
 query I
-SELECT list_reduce(duckboost_predict_proba(model, [1.0]), (a, b) -> a + b) BETWEEN 0.999 AND 1.001
+SELECT list_reduce(duckboost_predict_proba(model, [1.0]), lambda a, b: a + b) BETWEEN 0.999 AND 1.001
 FROM mc_models;
 ----
 true

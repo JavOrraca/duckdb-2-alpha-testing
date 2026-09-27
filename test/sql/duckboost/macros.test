@@ -15,13 +15,13 @@ FROM range(40) t(i);
 statement ok
 CREATE TABLE models AS
 FROM duckboost_fit(
-	train,
+	'train',
 	y,
 	[x1, x2],
 	options := MAP {
 		'backend': 'reference',
 		'task': 'regression',
-		'n_estimators': '12',
+		'n_estimators': '20',
 		'max_depth': '3',
 		'learning_rate': '0.2',
 		'feature_names': 'x1,x2'
@@ -42,7 +42,7 @@ true
 
 statement ok
 CREATE TABLE scored AS
-FROM duckboost_score((SELECT model FROM models), train, [x1, x2]);
+FROM duckboost_score((SELECT model FROM models), 'train', [x1, x2]);
 
 query I
 SELECT count(*) = 40 AND bool_and(prediction IS NOT NULL) FROM scored;

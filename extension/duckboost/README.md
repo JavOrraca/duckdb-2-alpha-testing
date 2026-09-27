@@ -69,11 +69,11 @@ SELECT duckboost_import('xgboost', xgb_dump_json, MAP {'task': 'binary', 'base_s
 SELECT duckboost_import('lightgbm', lgb_model_txt);
 SELECT duckboost_import('catboost', catboost_model_json);
 
--- Table macros (query_table wrappers)
+-- Table macros (query_table wrappers; pass table names as VARCHAR literals)
 CREATE TABLE models AS
-FROM duckboost_fit(train, y, [x1, x2], options := MAP {'n_estimators': '20', 'feature_names': 'x1,x2'});
+FROM duckboost_fit('train', y, [x1, x2], options := MAP {'n_estimators': '20', 'feature_names': 'x1,x2'});
 
-SELECT * FROM duckboost_score((SELECT model FROM models), test, [x1, x2]);
+SELECT * FROM duckboost_score((SELECT model FROM models), 'test', [x1, x2]);
 
 -- Multiclass: predict returns argmax class index; predict_proba returns softmax LIST
 SELECT duckboost_predict(model, features), duckboost_predict_proba(model, features);

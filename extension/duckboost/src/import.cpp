@@ -488,6 +488,11 @@ BoostModel ImportCatBoostJSON(const string &dump, const ImportOptions &options) 
 		idx_t flat_feature_index = 0;
 		vector<double> one_hot_values;
 	};
+	struct CtrElementInfo {
+		string element_type = "cat_feature_value";
+		idx_t feature_index = 0; // cat_feature_index or float_feature_index before remap
+		double border_or_value = 0;
+	};
 	struct CtrInfo {
 		string ctr_type = "Counter";
 		string identifier;
@@ -496,8 +501,7 @@ BoostModel ImportCatBoostJSON(const string &dump, const ImportOptions &options) 
 		double scale = 1;
 		double shift = 0;
 		vector<double> borders;
-		vector<idx_t> cat_flat_indices;
-		bool cats_only = true;
+		vector<CtrElementInfo> elements;
 	};
 
 	vector<FloatFeatureInfo> float_features;
@@ -688,8 +692,7 @@ BoostModel ImportCatBoostJSON(const string &dump, const ImportOptions &options) 
 									}
 									first_el = false;
 									p.Expect('{');
-									idx_t cat_idx = 0;
-									string element_type;
+									CtrElementInfo element;
 									bool first_efield = true;
 									while (!p.TryConsume('}')) {
 										if (!first_efield) {
@@ -699,18 +702,17 @@ BoostModel ImportCatBoostJSON(const string &dump, const ImportOptions &options) 
 										auto ekey = p.ParseString();
 										p.Expect(':');
 										if (ekey == "combination_element") {
-											element_type = p.ParseString();
-										} else if (ekey == "cat_feature_index") {
-											cat_idx = static_cast<idx_t>(p.ParseNumber());
+											element.element_type = p.ParseString();
+										} else if (ekey == "cat_feature_index" || ekey == "float_feature_index" ||
+										           ekey == "flat_feature_index") {
+											element.feature_index = static_cast<idx_t>(p.ParseNumber());
+										} else if (ekey == "border" || ekey == "value") {
+											element.border_or_value = p.ParseNumber();
 										} else {
 											p.SkipValue();
 										}
 									}
-									if (element_type == "cat_feature_value") {
-										ctr.cat_flat_indices.push_back(cat_idx); // remapped later
-									} else {
-										ctr.cats_only = false;
-									}
+									ctr.elements.push_back(std::move(element));
 								}
 							} else {
 								p.SkipValue();
@@ -971,15 +973,19 @@ BoostModel ImportCatBoostJSON(const string &dump, const ImportOptions &options) 
 		throw InvalidInputException("duckboost: catboost JSON missing oblivious_trees");
 	}
 
-	// Remap cat_feature_index → flat_feature_index for CTR elements.
-	for (auto &ctr : ctr_infos) {
-		for (auto &idx : ctr.cat_flat_indices) {
-			if (idx >= cat_features.size()) {
-				throw InvalidInputException("duckboost: catboost CTR cat_feature_index out of range");
-			}
-			idx = cat_features[idx].flat_feature_index;
+	auto remap_cat_index = [&](idx_t cat_idx) -> idx_t {
+		if (cat_idx >= cat_features.size()) {
+			throw InvalidInputException("duckboost: catboost CTR cat_feature_index out of range");
 		}
-	}
+		return cat_features[cat_idx].flat_feature_index;
+	};
+	auto remap_float_index = [&](idx_t float_idx) -> idx_t {
+		if (float_idx >= float_features.size()) {
+			// Some dumps already store flat indices under float_feature_index.
+			return float_idx;
+		}
+		return float_features[float_idx].flat_feature_index;
+	};
 
 	vector<GlobalCatSplit> global_splits;
 	for (auto &feat : float_features) {
@@ -1016,10 +1022,25 @@ BoostModel ImportCatBoostJSON(const string &dump, const ImportOptions &options) 
 		spec.prior_denominator = ctr.prior_denominator;
 		spec.scale = ctr.scale;
 		spec.shift = ctr.shift;
-		spec.cat_feature_indices = ctr.cat_flat_indices;
-		if (!ctr.cats_only) {
-			throw NotImplementedException(
-			    "duckboost: CatBoost OnlineCtr with non-categorical combination elements is not supported yet");
+		for (auto &el : ctr.elements) {
+			CtrCombineElement out;
+			auto lower = StringUtil::Lower(el.element_type);
+			if (lower == "cat_feature_value") {
+				out.kind = CtrElementKind::CAT_FEATURE_VALUE;
+				out.feature_index = remap_cat_index(el.feature_index);
+				spec.cat_feature_indices.push_back(out.feature_index);
+			} else if (lower == "float_feature") {
+				out.kind = CtrElementKind::FLOAT_FEATURE;
+				out.feature_index = remap_float_index(el.feature_index);
+				out.border_or_value = el.border_or_value;
+			} else if (lower == "cat_feature_exact_value") {
+				out.kind = CtrElementKind::CAT_FEATURE_EXACT_VALUE;
+				out.feature_index = remap_cat_index(el.feature_index);
+				out.border_or_value = el.border_or_value;
+			} else {
+				throw NotImplementedException("duckboost: unsupported CTR combination_element '%s'", el.element_type);
+			}
+			spec.elements.push_back(out);
 		}
 		if (!ctr.identifier.empty() && ctr_data_by_id.count(ctr.identifier)) {
 			auto &data = ctr_data_by_id[ctr.identifier];

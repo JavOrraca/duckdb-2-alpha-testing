@@ -2,6 +2,8 @@
 #include "duckboost/import.hpp"
 #include "duckboost/model.hpp"
 
+#include "duckdb/catalog/default/default_table_functions.hpp"
+#include "duckdb/common/constants.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/numeric_utils.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -14,6 +16,7 @@
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/parser/parsed_data/create_macro_info.hpp"
 
 #include <cmath>
 
@@ -249,6 +252,29 @@ void PredictFunction(DataChunk &args, ExpressionState &, Vector &result) {
 	}
 }
 
+void PredictProbaFunction(DataChunk &args, ExpressionState &, Vector &result) {
+	auto count = args.size();
+	result.SetVectorType(VectorType::FLAT_VECTOR);
+	UnifiedVectorFormat model_format;
+	args.data[0].ToUnifiedFormat(count, model_format);
+	auto model_data = UnifiedVectorFormat::GetData<string_t>(model_format);
+	auto writer = FlatVector::Writer<VectorListType<double>>(result, count);
+	for (idx_t i = 0; i < count; i++) {
+		auto model_idx = model_format.sel->get_index(i);
+		if (!model_format.validity.RowIsValid(model_idx)) {
+			writer.WriteNull();
+			continue;
+		}
+		auto model = BoostModel::FromJSON(model_data[model_idx].GetString());
+		auto features = ReadFeatureList(args.data[1], i);
+		auto proba = model.PredictProba(features);
+		idx_t class_idx = 0;
+		for (auto &child : writer.WriteList(proba.size())) {
+			child.WriteValue(proba[class_idx++]);
+		}
+	}
+}
+
 void EvaluateFunction(DataChunk &args, ExpressionState &, Vector &result) {
 	auto count = args.size();
 	UnifiedVectorFormat model_format;
@@ -281,11 +307,26 @@ void EvaluateFunction(DataChunk &args, ExpressionState &, Vector &result) {
 		if (options.metric == "mae" || (options.metric == "auto" && model.task == BoostTask::REGRESSION && false)) {
 			writer.WriteValue(std::fabs(pred - y));
 		} else if (options.metric == "accuracy" ||
-		           (options.metric == "auto" && model.task == BoostTask::BINARY)) {
-			writer.WriteValue((pred >= 0.5 ? 1.0 : 0.0) == y ? 1.0 : 0.0);
+		           (options.metric == "auto" &&
+		            (model.task == BoostTask::BINARY || model.task == BoostTask::MULTICLASS))) {
+			if (model.task == BoostTask::MULTICLASS) {
+				writer.WriteValue(pred == y ? 1.0 : 0.0);
+			} else {
+				writer.WriteValue((pred >= 0.5 ? 1.0 : 0.0) == y ? 1.0 : 0.0);
+			}
 		} else if (options.metric == "logloss") {
-			auto p = std::min(1.0 - 1e-15, std::max(1e-15, pred));
-			writer.WriteValue(-(y * std::log(p) + (1.0 - y) * std::log(1.0 - p)));
+			if (model.task == BoostTask::MULTICLASS) {
+				auto proba = model.PredictProba(features);
+				auto label = static_cast<idx_t>(y);
+				if (label >= proba.size()) {
+					throw InvalidInputException("duckboost: multiclass label out of range during logloss");
+				}
+				auto p = std::min(1.0 - 1e-15, std::max(1e-15, proba[label]));
+				writer.WriteValue(-std::log(p));
+			} else {
+				auto p = std::min(1.0 - 1e-15, std::max(1e-15, pred));
+				writer.WriteValue(-(y * std::log(p) + (1.0 - y) * std::log(1.0 - p)));
+			}
 		} else {
 			// default: squared error contribution (mean externally for RMSE)
 			auto err = pred - y;
@@ -521,6 +562,28 @@ void BackendsFunction(ClientContext &, TableFunctionInput &data, DataChunk &outp
 
 } // namespace
 
+// clang-format off
+static const DefaultTableMacro duckboost_table_macros[] = {
+	{DEFAULT_SCHEMA, "duckboost_fit", {"source", "y", "features", nullptr}, {{"options", "MAP {}"}, {nullptr, nullptr}}, R"(
+SELECT duckboost_train(y, features, options) AS model
+FROM query_table(source::VARCHAR)
+)"},
+	{DEFAULT_SCHEMA, "duckboost_score", {"model", "source", "features", nullptr}, {{nullptr, nullptr}}, R"(
+SELECT *, duckboost_predict(model, features) AS prediction
+FROM query_table(source::VARCHAR)
+)"},
+	{nullptr, nullptr, {nullptr}, {{nullptr, nullptr}}, nullptr}
+};
+// clang-format on
+
+void RegisterDuckBoostMacros(ExtensionLoader &loader) {
+	ParserOptions parser_options;
+	for (idx_t index = 0; duckboost_table_macros[index].name != nullptr; index++) {
+		auto info = DefaultTableFunctionGenerator::CreateTableMacroInfo(duckboost_table_macros[index], parser_options);
+		loader.RegisterFunction(*info);
+	}
+}
+
 void RegisterDuckBoostFunctions(ExtensionLoader &loader) {
 	AggregateFunctionSet train_set("duckboost_train");
 	train_set.AddFunction(GetTrainFunction(false));
@@ -534,6 +597,14 @@ void RegisterDuckBoostFunctions(ExtensionLoader &loader) {
 	    .AddParameter("features", LogicalType::LIST(LogicalType::DOUBLE));
 	predict_set.AddFunction(predict_fun);
 	loader.RegisterFunction(predict_set);
+
+	ScalarFunctionSet predict_proba_set("duckboost_predict_proba");
+	ScalarFunction predict_proba_fun({}, LogicalType::LIST(LogicalType::DOUBLE), PredictProbaFunction);
+	predict_proba_fun.GetSignature()
+	    .AddParameter("model", LogicalType::VARCHAR)
+	    .AddParameter("features", LogicalType::LIST(LogicalType::DOUBLE));
+	predict_proba_set.AddFunction(predict_proba_fun);
+	loader.RegisterFunction(predict_proba_set);
 
 	ScalarFunctionSet evaluate_set("duckboost_evaluate");
 	ScalarFunction evaluate_fun({}, LogicalType::DOUBLE, EvaluateFunction);
@@ -588,6 +659,8 @@ void RegisterDuckBoostFunctions(ExtensionLoader &loader) {
 
 	TableFunction backends_fun("duckboost_backends", {}, BackendsFunction, BackendsBind, BackendsInit);
 	loader.RegisterFunction(backends_fun);
+
+	RegisterDuckBoostMacros(loader);
 }
 
 } // namespace duckboost

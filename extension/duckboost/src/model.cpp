@@ -1,6 +1,7 @@
 #include "duckboost/model.hpp"
 #include "duckboost/json_util.hpp"
 
+#include "duckdb/common/numeric_utils.hpp"
 #include "duckdb/common/string_util.hpp"
 
 #include <cmath>
@@ -72,7 +73,15 @@ BoostBackend BackendFromString(const string &name) {
 }
 
 string TaskToString(BoostTask task) {
-	return task == BoostTask::BINARY ? "binary" : "regression";
+	switch (task) {
+	case BoostTask::BINARY:
+		return "binary";
+	case BoostTask::MULTICLASS:
+		return "multiclass";
+	case BoostTask::REGRESSION:
+	default:
+		return "regression";
+	}
 }
 
 BoostTask TaskFromString(const string &name) {
@@ -83,7 +92,10 @@ BoostTask TaskFromString(const string &name) {
 	if (lower == "binary" || lower == "classification" || lower == "logistic" || lower == "binomial") {
 		return BoostTask::BINARY;
 	}
-	throw InvalidInputException("duckboost: unknown task '%s' (expected regression or binary)", name);
+	if (lower == "multiclass" || lower == "multi_class" || lower == "multi-class" || lower == "softmax") {
+		return BoostTask::MULTICLASS;
+	}
+	throw InvalidInputException("duckboost: unknown task '%s' (expected regression, binary, or multiclass)", name);
 }
 
 bool BackendTrainingSupported(BoostBackend backend) {
@@ -187,8 +199,19 @@ string BoostModel::ToJSON() const {
 	out << ",\"backend\":\"" << EscapeJSON(BackendToString(backend)) << "\"";
 	out << ",\"task\":\"" << EscapeJSON(TaskToString(task)) << "\"";
 	out << ",\"base_score\":" << FormatDouble(base_score);
+	if (!base_scores.empty()) {
+		out << ",\"base_scores\":[";
+		for (idx_t i = 0; i < base_scores.size(); i++) {
+			if (i > 0) {
+				out << ',';
+			}
+			out << FormatDouble(base_scores[i]);
+		}
+		out << ']';
+	}
 	out << ",\"learning_rate\":" << FormatDouble(learning_rate);
 	out << ",\"n_features\":" << n_features;
+	out << ",\"n_classes\":" << n_classes;
 	out << ",\"feature_names\":[";
 	for (idx_t i = 0; i < feature_names.size(); i++) {
 		if (i > 0) {
@@ -242,10 +265,22 @@ BoostModel BoostModel::FromJSON(const string &json) {
 			model.task = TaskFromString(p.ParseString());
 		} else if (key == "base_score") {
 			model.base_score = p.ParseNumber();
+		} else if (key == "base_scores") {
+			p.Expect('[');
+			bool first_score = true;
+			while (!p.TryConsume(']')) {
+				if (!first_score) {
+					p.Expect(',');
+				}
+				first_score = false;
+				model.base_scores.push_back(p.ParseNumber());
+			}
 		} else if (key == "learning_rate") {
 			model.learning_rate = p.ParseNumber();
 		} else if (key == "n_features") {
 			model.n_features = static_cast<idx_t>(p.ParseNumber());
+		} else if (key == "n_classes") {
+			model.n_classes = static_cast<idx_t>(p.ParseNumber());
 		} else if (key == "feature_names") {
 			p.Expect('[');
 			bool first_name = true;
@@ -326,41 +361,126 @@ BoostModel BoostModel::FromJSON(const string &json) {
 	if (model.n_features == 0 && !model.feature_names.empty()) {
 		model.n_features = model.feature_names.size();
 	}
+	if (model.task == BoostTask::MULTICLASS) {
+		if (model.n_classes < 2) {
+			model.n_classes = MaxValue<idx_t>(model.base_scores.size(), 2);
+		}
+	} else if (model.n_classes == 0) {
+		model.n_classes = 1;
+	}
 	return model;
 }
 
+double BoostModel::ClassBias(idx_t class_idx) const {
+	if (class_idx < base_scores.size()) {
+		return base_scores[class_idx];
+	}
+	return base_score;
+}
+
+double BoostModel::EvalTree(const BoostTree &tree, const vector<double> &features) const {
+	idx_t node_idx = 0;
+	while (true) {
+		if (node_idx >= tree.nodes.size()) {
+			throw InvalidInputException("duckboost: corrupt tree during prediction");
+		}
+		auto &node = tree.nodes[node_idx];
+		if (node.is_leaf) {
+			return node.value;
+		}
+		if (node.feature >= features.size()) {
+			throw InvalidInputException("duckboost: feature index out of range during prediction");
+		}
+		node_idx = features[node.feature] < node.threshold ? node.left : node.right;
+	}
+}
+
 double BoostModel::PredictRaw(const vector<double> &features) const {
+	if (task == BoostTask::MULTICLASS) {
+		throw InvalidInputException("duckboost: PredictRaw is not defined for multiclass; use Predict / PredictProba");
+	}
 	if (features.size() < n_features) {
 		throw InvalidInputException("duckboost: expected at least %llu features, got %llu",
 		                            (unsigned long long)n_features, (unsigned long long)features.size());
 	}
-	double score = base_score;
+	double score = ClassBias(0);
 	for (auto &tree : trees) {
-		idx_t node_idx = 0;
-		while (true) {
-			if (node_idx >= tree.nodes.size()) {
-				throw InvalidInputException("duckboost: corrupt tree during prediction");
-			}
-			auto &node = tree.nodes[node_idx];
-			if (node.is_leaf) {
-				score += learning_rate * node.value;
-				break;
-			}
-			if (node.feature >= features.size()) {
-				throw InvalidInputException("duckboost: feature index out of range during prediction");
-			}
-			node_idx = features[node.feature] < node.threshold ? node.left : node.right;
-		}
+		score += learning_rate * EvalTree(tree, features);
 	}
 	return score;
 }
 
+vector<double> BoostModel::PredictRawMulti(const vector<double> &features) const {
+	if (features.size() < n_features) {
+		throw InvalidInputException("duckboost: expected at least %llu features, got %llu",
+		                            (unsigned long long)n_features, (unsigned long long)features.size());
+	}
+	if (task != BoostTask::MULTICLASS) {
+		return {PredictRaw(features)};
+	}
+	if (n_classes < 2) {
+		throw InvalidInputException("duckboost: multiclass model requires n_classes >= 2");
+	}
+	if (trees.size() % n_classes != 0) {
+		throw InvalidInputException("duckboost: multiclass tree count %llu is not divisible by n_classes %llu",
+		                            (unsigned long long)trees.size(), (unsigned long long)n_classes);
+	}
+	vector<double> scores(n_classes);
+	for (idx_t c = 0; c < n_classes; c++) {
+		scores[c] = ClassBias(c);
+	}
+	const idx_t n_rounds = trees.size() / n_classes;
+	for (idx_t round = 0; round < n_rounds; round++) {
+		for (idx_t c = 0; c < n_classes; c++) {
+			scores[c] += learning_rate * EvalTree(trees[round * n_classes + c], features);
+		}
+	}
+	return scores;
+}
+
 double BoostModel::Predict(const vector<double> &features) const {
+	if (task == BoostTask::MULTICLASS) {
+		auto scores = PredictRawMulti(features);
+		idx_t best = 0;
+		for (idx_t c = 1; c < scores.size(); c++) {
+			if (scores[c] > scores[best]) {
+				best = c;
+			}
+		}
+		return static_cast<double>(best);
+	}
 	auto raw = PredictRaw(features);
 	if (task == BoostTask::BINARY) {
 		return Sigmoid(raw);
 	}
 	return raw;
+}
+
+vector<double> BoostModel::PredictProba(const vector<double> &features) const {
+	if (task == BoostTask::REGRESSION) {
+		return {Predict(features)};
+	}
+	if (task == BoostTask::BINARY) {
+		auto p = Predict(features);
+		return {1.0 - p, p};
+	}
+	auto scores = PredictRawMulti(features);
+	double max_score = scores[0];
+	for (idx_t i = 1; i < scores.size(); i++) {
+		max_score = MaxValue(max_score, scores[i]);
+	}
+	vector<double> proba(scores.size());
+	double sum = 0;
+	for (idx_t i = 0; i < scores.size(); i++) {
+		proba[i] = std::exp(scores[i] - max_score);
+		sum += proba[i];
+	}
+	if (sum > 0) {
+		for (auto &p : proba) {
+			p /= sum;
+		}
+	}
+	return proba;
 }
 
 string ExportModelSQL(const BoostModel &model, const string &table_name, const vector<string> &feature_columns,
@@ -377,8 +497,45 @@ string ExportModelSQL(const BoostModel &model, const string &table_name, const v
 		                            (unsigned long long)model.n_features);
 	}
 	auto alias = QuoteIdent(options.prediction_alias);
+
+	if (model.task == BoostTask::MULTICLASS) {
+		if (model.n_classes < 2 || model.trees.size() % model.n_classes != 0) {
+			throw InvalidInputException("duckboost: invalid multiclass model for SQL export");
+		}
+		const idx_t n_rounds = model.trees.size() / model.n_classes;
+		std::ostringstream inner;
+		inner << "SELECT ";
+		for (idx_t c = 0; c < model.n_classes; c++) {
+			if (c > 0) {
+				inner << ", ";
+			}
+			string expr = FormatDouble(model.ClassBias(c));
+			for (idx_t round = 0; round < n_rounds; round++) {
+				expr += " + " + FormatDouble(model.learning_rate) + " * (" +
+				        TreeToSQL(model.trees[round * model.n_classes + c], columns, 0) + ")";
+			}
+			inner << "(" << expr << ") AS " << QuoteIdent("score_" + std::to_string(c));
+		}
+		inner << " FROM " << QuoteIdent(table_name);
+
+		// Argmax over class scores (ties → lowest class index).
+		string argmax = "0";
+		for (idx_t c = 1; c < model.n_classes; c++) {
+			string cond;
+			for (idx_t prev = 0; prev < c; prev++) {
+				if (prev > 0) {
+					cond += " AND ";
+				}
+				cond += QuoteIdent("score_" + std::to_string(c)) + " > " + QuoteIdent("score_" + std::to_string(prev));
+			}
+			argmax = "CASE WHEN " + cond + " THEN " + std::to_string(c) + " ELSE " + argmax + " END";
+		}
+		return "SELECT (" + argmax + ") AS " + alias + " FROM (" + inner.str() + ") AS " +
+		       QuoteIdent("_duckboost_scores");
+	}
+
 	if (!options.separate_trees) {
-		string expr = FormatDouble(model.base_score);
+		string expr = FormatDouble(model.ClassBias(0));
 		for (auto &tree : model.trees) {
 			expr += " + " + FormatDouble(model.learning_rate) + " * (" + TreeToSQL(tree, columns, 0) + ")";
 		}
@@ -397,9 +554,9 @@ string ExportModelSQL(const BoostModel &model, const string &table_name, const v
 		inner << "(" << TreeToSQL(model.trees[t], columns, 0) << ") AS " << QuoteIdent("tree_" + std::to_string(t));
 	}
 	if (model.trees.empty()) {
-		inner << FormatDouble(model.base_score) << " AS " << QuoteIdent("base_score");
+		inner << FormatDouble(model.ClassBias(0)) << " AS " << QuoteIdent("base_score");
 	} else {
-		inner << ", " << FormatDouble(model.base_score) << " AS " << QuoteIdent("base_score");
+		inner << ", " << FormatDouble(model.ClassBias(0)) << " AS " << QuoteIdent("base_score");
 	}
 	inner << " FROM " << QuoteIdent(table_name);
 

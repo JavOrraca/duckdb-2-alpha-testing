@@ -20,6 +20,8 @@ struct ImportOptions {
 	bool base_score_set = false;
 	double learning_rate = 1.0;
 	bool learning_rate_set = false;
+	idx_t n_classes = 0;
+	bool n_classes_set = false;
 	vector<string> feature_names;
 
 	static ImportOptions FromMap(const unordered_map<string, string> &options);

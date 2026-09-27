@@ -592,6 +592,7 @@ void RegisterDuckBoostFunctions(ExtensionLoader &loader) {
 
 	ScalarFunctionSet predict_set("duckboost_predict");
 	ScalarFunction predict_fun({}, LogicalType::DOUBLE, PredictFunction);
+	predict_fun.SetFallible();
 	predict_fun.GetSignature()
 	    .AddParameter("model", LogicalType::VARCHAR)
 	    .AddParameter("features", LogicalType::LIST(LogicalType::DOUBLE));
@@ -600,6 +601,7 @@ void RegisterDuckBoostFunctions(ExtensionLoader &loader) {
 
 	ScalarFunctionSet predict_proba_set("duckboost_predict_proba");
 	ScalarFunction predict_proba_fun({}, LogicalType::LIST(LogicalType::DOUBLE), PredictProbaFunction);
+	predict_proba_fun.SetFallible();
 	predict_proba_fun.GetSignature()
 	    .AddParameter("model", LogicalType::VARCHAR)
 	    .AddParameter("features", LogicalType::LIST(LogicalType::DOUBLE));
@@ -629,12 +631,14 @@ void RegisterDuckBoostFunctions(ExtensionLoader &loader) {
 
 	ScalarFunctionSet to_sql_set("duckboost_to_sql");
 	ScalarFunction to_sql_fun({}, LogicalType::VARCHAR, ToSQLFunction);
+	to_sql_fun.SetFallible();
 	to_sql_fun.GetSignature()
 	    .AddParameter("model", LogicalType::VARCHAR)
 	    .AddParameter("table_name", LogicalType::VARCHAR)
 	    .AddParameter("feature_columns", LogicalType::LIST(LogicalType::VARCHAR));
 	to_sql_set.AddFunction(to_sql_fun);
 	ScalarFunction to_sql_opts({}, LogicalType::VARCHAR, ToSQLFunction);
+	to_sql_opts.SetFallible();
 	to_sql_opts.GetSignature()
 	    .AddParameter("model", LogicalType::VARCHAR)
 	    .AddParameter("table_name", LogicalType::VARCHAR)
@@ -645,11 +649,13 @@ void RegisterDuckBoostFunctions(ExtensionLoader &loader) {
 
 	ScalarFunctionSet import_set("duckboost_import");
 	ScalarFunction import_fun({}, LogicalType::VARCHAR, ImportFunction);
+	import_fun.SetFallible();
 	import_fun.GetSignature()
 	    .AddParameter("backend", LogicalType::VARCHAR)
 	    .AddParameter("dump", LogicalType::VARCHAR);
 	import_set.AddFunction(import_fun);
 	ScalarFunction import_opts({}, LogicalType::VARCHAR, ImportFunction);
+	import_opts.SetFallible();
 	import_opts.GetSignature()
 	    .AddParameter("backend", LogicalType::VARCHAR)
 	    .AddParameter("dump", LogicalType::VARCHAR)

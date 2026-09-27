@@ -94,8 +94,9 @@ Native XGBoost / LightGBM / CatBoost linking is intentionally opt-in. Prefer tra
 
 - Imported models set `learning_rate = 1.0` and bake vendor shrinkage/scale into leaf values (XGBoost dump leaves already include η; LightGBM `shrinkage` and CatBoost `scale_and_bias` are applied at import).
 - LightGBM numerical `<=` splits are converted to duckboost `<` via `nextafter(threshold, +∞)`.
-- CatBoost support is float/`FloatFeature` oblivious trees (binary/regression and multiclass). No OneHot/CTR yet.
+- CatBoost support: `FloatFeature`, `OneHotFeature`, and `OnlineCtr` (Counter/Borders with categorical-only combinations). Pass categorical CityHash values as numeric features.
 - Multiclass CatBoost JSON uses class-blocked `leaf_values` (`2^depth` values per class). Import expands each oblivious tree into `n_classes` duckboost trees (layout `[round][class]`).
+- OnlineCtr requires `ctr_data` in the dump (`save_model(..., pool=...)`). `duckboost_to_sql` is not supported for CTR models yet (use `duckboost_predict`).
 - Optional import map keys: `task`, `base_score`, `learning_rate`, `feature_names`, `n_classes`.
 
 ## Model format
@@ -128,5 +129,5 @@ For `task: "multiclass"`, `n_classes >= 2`, optional `base_scores` holds per-cla
 ## Roadmap
 
 - Native trainers behind `DUCKBOOST_WITH_*` CMake options
-- CatBoost OneHot/CTR dump support
+- OnlineCtr with float/one-hot combination elements + SQL export for CTR models
 - Community extension packaging

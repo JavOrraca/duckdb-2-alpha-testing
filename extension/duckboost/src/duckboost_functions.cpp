@@ -1,4 +1,5 @@
 #include "duckboost/functions.hpp"
+#include "duckboost/import.hpp"
 #include "duckboost/model.hpp"
 
 #include "duckdb/common/exception.hpp"
@@ -472,8 +473,11 @@ void ImportFunction(DataChunk &args, ExpressionState &, Vector &result) {
 			continue;
 		}
 		auto backend = BackendFromString(backend_data[backend_idx].GetString());
-		auto model = BoostModel::FromJSON(model_data[model_idx].GetString());
-		model.backend = backend;
+		ImportOptions options;
+		if (args.ColumnCount() >= 3) {
+			options = ImportOptions::FromMap(MapVectorToOptions(args.data[2], i));
+		}
+		auto model = ImportModel(backend, model_data[model_idx].GetString(), options);
 		writer.WriteValue(StringVector::AddString(result, model.ToJSON()));
 	}
 }
@@ -572,8 +576,14 @@ void RegisterDuckBoostFunctions(ExtensionLoader &loader) {
 	ScalarFunction import_fun({}, LogicalType::VARCHAR, ImportFunction);
 	import_fun.GetSignature()
 	    .AddParameter("backend", LogicalType::VARCHAR)
-	    .AddParameter("model_json", LogicalType::VARCHAR);
+	    .AddParameter("dump", LogicalType::VARCHAR);
 	import_set.AddFunction(import_fun);
+	ScalarFunction import_opts({}, LogicalType::VARCHAR, ImportFunction);
+	import_opts.GetSignature()
+	    .AddParameter("backend", LogicalType::VARCHAR)
+	    .AddParameter("dump", LogicalType::VARCHAR)
+	    .AddParameter("options", LogicalType::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR));
+	import_set.AddFunction(import_opts);
 	loader.RegisterFunction(import_set);
 
 	TableFunction backends_fun("duckboost_backends", {}, BackendsFunction, BackendsBind, BackendsInit);

@@ -48,7 +48,8 @@ if(DUCKBOOST_WITH_XGBOOST)
       message(FATAL_ERROR "duckboost: DUCKBOOST_WITH_XGBOOST=ON but libxgboost not found (set XGBOOST_ROOT or use "
                           "DUCKBOOST_NATIVE_STUB_ONLY=ON)")
     endif()
-    target_link_libraries(duckboost_extension PRIVATE ${XGBOOST_LIBRARY})
+    # build_extension_library uses the plain target_link_libraries signature.
+    target_link_libraries(duckboost_extension ${XGBOOST_LIBRARY})
     get_filename_component(XGBOOST_LIB_DIR "${XGBOOST_LIBRARY}" DIRECTORY)
     set_property(TARGET duckboost_extension APPEND PROPERTY BUILD_RPATH "${XGBOOST_LIB_DIR}")
     set_property(TARGET duckboost_extension APPEND PROPERTY INSTALL_RPATH "${XGBOOST_LIB_DIR}")
@@ -77,7 +78,7 @@ if(DUCKBOOST_WITH_LIGHTGBM)
       message(FATAL_ERROR "duckboost: DUCKBOOST_WITH_LIGHTGBM=ON but lib_lightgbm not found (set LIGHTGBM_ROOT or use "
                           "DUCKBOOST_NATIVE_STUB_ONLY=ON)")
     endif()
-    target_link_libraries(duckboost_extension PRIVATE ${LIGHTGBM_LIBRARY})
+    target_link_libraries(duckboost_extension ${LIGHTGBM_LIBRARY})
     get_filename_component(LIGHTGBM_LIB_DIR "${LIGHTGBM_LIBRARY}" DIRECTORY)
     set_property(TARGET duckboost_extension APPEND PROPERTY BUILD_RPATH "${LIGHTGBM_LIB_DIR}")
     set_property(TARGET duckboost_extension APPEND PROPERTY INSTALL_RPATH "${LIGHTGBM_LIB_DIR}")

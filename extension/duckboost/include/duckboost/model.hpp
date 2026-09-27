@@ -38,6 +38,19 @@ struct BoostTree {
 	vector<TreeNode> nodes;
 };
 
+enum class CtrElementKind : uint8_t {
+	CAT_FEATURE_VALUE = 0,
+	FLOAT_FEATURE = 1,
+	CAT_FEATURE_EXACT_VALUE = 2
+};
+
+//! One component of a CatBoost CTR combination hash.
+struct CtrCombineElement {
+	CtrElementKind kind = CtrElementKind::CAT_FEATURE_VALUE;
+	idx_t feature_index = 0; // flat feature index
+	double border_or_value = 0;
+};
+
 //! CatBoost OnlineCtr feature evaluated at predict time into a synthetic feature slot.
 struct CtrFeatureSpec {
 	idx_t feature_index = 0;
@@ -47,7 +60,9 @@ struct CtrFeatureSpec {
 	double scale = 1;
 	double shift = 0;
 	int64_t counter_denominator = 0;
-	//! Flat feature indices of categorical hashes (CityHash already applied by caller).
+	//! Combination elements in CatBoost order (cat / float bin / one-hot).
+	vector<CtrCombineElement> elements;
+	//! Legacy/simple path: flat categorical indices only (used when elements empty).
 	vector<idx_t> cat_feature_indices;
 	//! Counter: hash → count. Borders: hash → (failures, successes) packed as pair in parallel maps.
 	vector<uint64_t> hash_keys;

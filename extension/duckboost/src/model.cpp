@@ -48,9 +48,33 @@ uint64_t FeatureHashU64(double value) {
 	return static_cast<uint64_t>(static_cast<uint32_t>(static_cast<int32_t>(as_i)));
 }
 
-uint64_t CombineCtrHash(const vector<idx_t> &cat_indices, const vector<double> &features) {
+uint64_t CtrElementValue(const CtrCombineElement &element, const vector<double> &features) {
+	if (element.feature_index >= features.size()) {
+		throw InvalidInputException("duckboost: CTR combination feature index out of range");
+	}
+	switch (element.kind) {
+	case CtrElementKind::CAT_FEATURE_VALUE:
+		return FeatureHashU64(features[element.feature_index]);
+	case CtrElementKind::FLOAT_FEATURE:
+		// CatBoost combination float bin: feature >= border → 1 else 0.
+		return features[element.feature_index] >= element.border_or_value ? 1 : 0;
+	case CtrElementKind::CAT_FEATURE_EXACT_VALUE:
+		return features[element.feature_index] == element.border_or_value ? 1 : 0;
+	default:
+		throw InvalidInputException("duckboost: unknown CTR combination element kind");
+	}
+}
+
+uint64_t CombineCtrHash(const CtrFeatureSpec &ctr, const vector<double> &features) {
 	uint64_t hash = 0;
-	for (auto idx : cat_indices) {
+	if (!ctr.elements.empty()) {
+		for (auto &element : ctr.elements) {
+			auto value = CtrElementValue(element, features);
+			hash = CTR_MAGIC_MULT * (hash + CTR_MAGIC_MULT * value);
+		}
+		return hash;
+	}
+	for (auto idx : ctr.cat_feature_indices) {
 		if (idx >= features.size()) {
 			throw InvalidInputException("duckboost: CTR cat feature index out of range");
 		}
@@ -60,43 +84,129 @@ uint64_t CombineCtrHash(const vector<idx_t> &cat_indices, const vector<double> &
 	return hash;
 }
 
-double EvaluateCtrValue(const CtrFeatureSpec &ctr, const vector<double> &features) {
-	auto key = CombineCtrHash(ctr.cat_feature_indices, features);
-	unordered_map<uint64_t, idx_t> lookup;
-	lookup.reserve(ctr.hash_keys.size());
-	for (idx_t i = 0; i < ctr.hash_keys.size(); i++) {
-		lookup[ctr.hash_keys[i]] = i;
-	}
-	auto it = lookup.find(key);
+double CtrValueFromCounts(const CtrFeatureSpec &ctr, int64_t count_or_failures, int64_t successes) {
 	auto type = StringUtil::Lower(ctr.ctr_type);
 	if (type == "counter" || type == "featurefreq" || type == "freq") {
-		int64_t count = 0;
-		if (it != lookup.end()) {
-			count = ctr.hash_values[it->second];
-		}
 		auto denom = static_cast<double>(ctr.counter_denominator) + ctr.prior_denominator;
 		if (denom == 0) {
 			return ctr.shift;
 		}
-		return ctr.shift + ctr.scale * ((ctr.prior_numerator + static_cast<double>(count)) / denom);
+		return ctr.shift + ctr.scale * ((ctr.prior_numerator + static_cast<double>(count_or_failures)) / denom);
 	}
 	if (type == "borders" || type == "buckets" || type == "border") {
-		int64_t failures = 0;
-		int64_t successes = 0;
-		if (it != lookup.end()) {
-			failures = ctr.hash_values[it->second];
-			if (it->second < ctr.hash_values_alt.size()) {
-				successes = ctr.hash_values_alt[it->second];
-			}
-		}
 		auto denom = ctr.prior_numerator + static_cast<double>(successes) + ctr.prior_denominator +
-		             static_cast<double>(failures);
+		             static_cast<double>(count_or_failures);
 		if (denom == 0) {
 			return ctr.shift;
 		}
 		return ctr.shift + ctr.scale * ((ctr.prior_numerator + static_cast<double>(successes)) / denom);
 	}
 	throw NotImplementedException("duckboost: unsupported CTR type '%s'", ctr.ctr_type);
+}
+
+double EvaluateCtrValue(const CtrFeatureSpec &ctr, const vector<double> &features) {
+	auto key = CombineCtrHash(ctr, features);
+	unordered_map<uint64_t, idx_t> lookup;
+	lookup.reserve(ctr.hash_keys.size());
+	for (idx_t i = 0; i < ctr.hash_keys.size(); i++) {
+		lookup[ctr.hash_keys[i]] = i;
+	}
+	auto it = lookup.find(key);
+	int64_t primary = 0;
+	int64_t secondary = 0;
+	if (it != lookup.end()) {
+		primary = ctr.hash_values[it->second];
+		if (it->second < ctr.hash_values_alt.size()) {
+			secondary = ctr.hash_values_alt[it->second];
+		}
+	}
+	return CtrValueFromCounts(ctr, primary, secondary);
+}
+
+string CtrElementKindToString(CtrElementKind kind) {
+	switch (kind) {
+	case CtrElementKind::FLOAT_FEATURE:
+		return "float_feature";
+	case CtrElementKind::CAT_FEATURE_EXACT_VALUE:
+		return "cat_feature_exact_value";
+	case CtrElementKind::CAT_FEATURE_VALUE:
+	default:
+		return "cat_feature_value";
+	}
+}
+
+CtrElementKind CtrElementKindFromString(const string &name) {
+	auto lower = StringUtil::Lower(name);
+	if (lower == "float_feature") {
+		return CtrElementKind::FLOAT_FEATURE;
+	}
+	if (lower == "cat_feature_exact_value") {
+		return CtrElementKind::CAT_FEATURE_EXACT_VALUE;
+	}
+	if (lower == "cat_feature_value") {
+		return CtrElementKind::CAT_FEATURE_VALUE;
+	}
+	throw InvalidInputException("duckboost: unknown CTR combination_element '%s'", name);
+}
+
+string SqlCtrElementValueExpr(const CtrCombineElement &element, const vector<string> &feature_columns) {
+	if (element.feature_index >= feature_columns.size()) {
+		throw InvalidInputException("duckboost: CTR SQL export missing feature column for index %llu",
+		                            (unsigned long long)element.feature_index);
+	}
+	auto feature = QuoteIdent(feature_columns[element.feature_index]);
+	switch (element.kind) {
+	case CtrElementKind::CAT_FEATURE_VALUE:
+		// Feature is already a CityHash; cast through INT then UINT32 bit pattern.
+		return "CAST(CAST(CAST(ROUND(" + feature + ") AS BIGINT) AS INTEGER) AS UINTEGER)::UHUGEINT";
+	case CtrElementKind::FLOAT_FEATURE:
+		return "(CASE WHEN " + feature + " >= " + FormatDouble(element.border_or_value) +
+		       " THEN 1::UHUGEINT ELSE 0::UHUGEINT END)";
+	case CtrElementKind::CAT_FEATURE_EXACT_VALUE:
+		return "(CASE WHEN " + feature + " = " + FormatDouble(element.border_or_value) +
+		       " THEN 1::UHUGEINT ELSE 0::UHUGEINT END)";
+	default:
+		throw InvalidInputException("duckboost: unknown CTR combination element in SQL export");
+	}
+}
+
+string SqlCombineCtrHashExpr(const CtrFeatureSpec &ctr, const vector<string> &feature_columns) {
+	const string magic = "5260239421824346981::UHUGEINT"; // 0x4906ba494954cb65
+	const string mod = "18446744073709551616::UHUGEINT";
+	string hash = "0::UHUGEINT";
+	auto append_value = [&](const string &value_expr) {
+		hash = "((" + magic + " * ((" + hash + " + ((" + magic + " * (" + value_expr + ")) % " + mod + ")) % " + mod +
+		       ")) % " + mod + ")";
+	};
+	if (!ctr.elements.empty()) {
+		for (auto &element : ctr.elements) {
+			append_value(SqlCtrElementValueExpr(element, feature_columns));
+		}
+	} else {
+		for (auto idx : ctr.cat_feature_indices) {
+			CtrCombineElement element;
+			element.kind = CtrElementKind::CAT_FEATURE_VALUE;
+			element.feature_index = idx;
+			append_value(SqlCtrElementValueExpr(element, feature_columns));
+		}
+	}
+	return "CAST(" + hash + " AS UBIGINT)";
+}
+
+string SqlCtrValueExpr(const CtrFeatureSpec &ctr, const vector<string> &feature_columns) {
+	auto hash_expr = SqlCombineCtrHashExpr(ctr, feature_columns);
+	double default_value = CtrValueFromCounts(ctr, 0, 0);
+	if (ctr.hash_keys.empty()) {
+		return FormatDouble(default_value);
+	}
+	string expr = "CASE " + hash_expr;
+	for (idx_t i = 0; i < ctr.hash_keys.size(); i++) {
+		int64_t secondary = i < ctr.hash_values_alt.size() ? ctr.hash_values_alt[i] : 0;
+		auto value = CtrValueFromCounts(ctr, ctr.hash_values[i], secondary);
+		expr += " WHEN " + std::to_string(ctr.hash_keys[i]) + "::UBIGINT THEN " + FormatDouble(value);
+	}
+	expr += " ELSE " + FormatDouble(default_value) + " END";
+	return expr;
 }
 
 double Sigmoid(double x) {
@@ -328,7 +438,17 @@ string BoostModel::ToJSON() const {
 			out << ",\"scale\":" << FormatDouble(ctr.scale);
 			out << ",\"shift\":" << FormatDouble(ctr.shift);
 			out << ",\"counter_denominator\":" << ctr.counter_denominator;
-			out << ",\"cat_feature_indices\":[";
+			out << ",\"elements\":[";
+			for (idx_t i = 0; i < ctr.elements.size(); i++) {
+				if (i > 0) {
+					out << ',';
+				}
+				auto &el = ctr.elements[i];
+				out << "{\"kind\":\"" << EscapeJSON(CtrElementKindToString(el.kind)) << "\"";
+				out << ",\"feature_index\":" << el.feature_index;
+				out << ",\"border_or_value\":" << FormatDouble(el.border_or_value) << '}';
+			}
+			out << "],\"cat_feature_indices\":[";
 			for (idx_t i = 0; i < ctr.cat_feature_indices.size(); i++) {
 				if (i > 0) {
 					out << ',';
@@ -511,6 +631,36 @@ BoostModel BoostModel::FromJSON(const string &json) {
 						ctr.shift = p.ParseNumber();
 					} else if (ck == "counter_denominator") {
 						ctr.counter_denominator = static_cast<int64_t>(p.ParseNumber());
+					} else if (ck == "elements") {
+						p.Expect('[');
+						bool first_el = true;
+						while (!p.TryConsume(']')) {
+							if (!first_el) {
+								p.Expect(',');
+							}
+							first_el = false;
+							p.Expect('{');
+							CtrCombineElement element;
+							bool first_efield = true;
+							while (!p.TryConsume('}')) {
+								if (!first_efield) {
+									p.Expect(',');
+								}
+								first_efield = false;
+								auto ek = p.ParseString();
+								p.Expect(':');
+								if (ek == "kind" || ek == "combination_element") {
+									element.kind = CtrElementKindFromString(p.ParseString());
+								} else if (ek == "feature_index") {
+									element.feature_index = static_cast<idx_t>(p.ParseNumber());
+								} else if (ek == "border_or_value" || ek == "border" || ek == "value") {
+									element.border_or_value = p.ParseNumber();
+								} else {
+									p.SkipValue();
+								}
+							}
+							ctr.elements.push_back(element);
+						}
 					} else if (ck == "cat_feature_indices") {
 						p.Expect('[');
 						bool first_idx = true;
@@ -722,18 +872,40 @@ string ExportModelSQL(const BoostModel &model, const string &table_name, const v
 	if (table_name.empty()) {
 		throw InvalidInputException("duckboost: table_name must not be empty");
 	}
-	if (!model.ctr_features.empty()) {
-		throw NotImplementedException(
-		    "duckboost: duckboost_to_sql does not support CatBoost OnlineCtr models yet; use duckboost_predict");
+	vector<string> raw_columns = feature_columns;
+	if (raw_columns.empty()) {
+		raw_columns = model.feature_names;
 	}
-	vector<string> columns = feature_columns;
-	if (columns.empty()) {
-		columns = model.feature_names;
-	}
-	if (columns.size() < model.n_features) {
+	const idx_t required_raw = model.n_raw_features > 0 ? model.n_raw_features : model.n_features;
+	if (raw_columns.size() < required_raw) {
 		throw InvalidInputException("duckboost: need %llu feature column names for SQL export",
-		                            (unsigned long long)model.n_features);
+		                            (unsigned long long)required_raw);
 	}
+
+	vector<string> columns = raw_columns;
+	if (columns.size() < model.n_features) {
+		columns.resize(model.n_features);
+	}
+	for (auto &ctr : model.ctr_features) {
+		if (ctr.feature_index >= columns.size()) {
+			columns.resize(ctr.feature_index + 1);
+		}
+		if (columns[ctr.feature_index].empty()) {
+			columns[ctr.feature_index] = "_duckboost_ctr_" + std::to_string(ctr.feature_index);
+		}
+	}
+
+	string from_sql = QuoteIdent(table_name);
+	if (!model.ctr_features.empty()) {
+		std::ostringstream src;
+		src << "(SELECT *";
+		for (auto &ctr : model.ctr_features) {
+			src << ", (" << SqlCtrValueExpr(ctr, raw_columns) << ") AS " << QuoteIdent(columns[ctr.feature_index]);
+		}
+		src << " FROM " << QuoteIdent(table_name) << ") AS " << QuoteIdent("_duckboost_src");
+		from_sql = src.str();
+	}
+
 	auto alias = QuoteIdent(options.prediction_alias);
 
 	if (model.task == BoostTask::MULTICLASS) {
@@ -754,7 +926,7 @@ string ExportModelSQL(const BoostModel &model, const string &table_name, const v
 			}
 			inner << "(" << expr << ") AS " << QuoteIdent("score_" + std::to_string(c));
 		}
-		inner << " FROM " << QuoteIdent(table_name);
+		inner << " FROM " << from_sql;
 
 		// Argmax over class scores (ties → lowest class index).
 		string argmax = "0";
@@ -780,7 +952,7 @@ string ExportModelSQL(const BoostModel &model, const string &table_name, const v
 		if (model.task == BoostTask::BINARY) {
 			expr = "1.0 / (1.0 + EXP(-(" + expr + ")))";
 		}
-		return "SELECT (" + expr + ") AS " + alias + " FROM " + QuoteIdent(table_name);
+		return "SELECT (" + expr + ") AS " + alias + " FROM " + from_sql;
 	}
 
 	std::ostringstream inner;
@@ -796,7 +968,7 @@ string ExportModelSQL(const BoostModel &model, const string &table_name, const v
 	} else {
 		inner << ", " << FormatDouble(model.ClassBias(0)) << " AS " << QuoteIdent("base_score");
 	}
-	inner << " FROM " << QuoteIdent(table_name);
+	inner << " FROM " << from_sql;
 
 	string sum_expr = QuoteIdent("base_score");
 	for (idx_t t = 0; t < model.trees.size(); t++) {

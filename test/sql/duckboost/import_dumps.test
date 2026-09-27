@@ -134,7 +134,7 @@ true
 statement error
 SELECT duckboost_import(
 	'catboost',
-	'{"oblivious_trees":[{"leaf_values":[0.0,1.0],"splits":[{"split_type":"OneHotFeature","border":0.0,"float_feature_index":0}]}],"features_info":{"float_features":[]}}'
+	'{"oblivious_trees":[{"leaf_values":[0.0,1.0],"splits":[{"split_type":"UnknownSplit","border":0.0,"float_feature_index":0}]}],"features_info":{"float_features":[]}}'
 );
 ----
-<REGEX>:.*FloatFeature only.*
+<REGEX>:.*split_type.*not supported.*

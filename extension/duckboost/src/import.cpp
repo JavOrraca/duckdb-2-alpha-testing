@@ -59,9 +59,18 @@ void ApplyImportOptions(BoostModel &model, const ImportOptions &options) {
 	}
 	if (options.base_score_set) {
 		model.base_score = options.base_score;
+		if (model.task != BoostTask::MULTICLASS) {
+			model.base_scores.clear();
+		}
 	}
 	if (options.learning_rate_set) {
 		model.learning_rate = options.learning_rate;
+	}
+	if (options.n_classes_set) {
+		model.n_classes = options.n_classes;
+		if (model.n_classes >= 2) {
+			model.task = BoostTask::MULTICLASS;
+		}
 	}
 	if (!options.feature_names.empty()) {
 		model.feature_names = options.feature_names;
@@ -74,6 +83,12 @@ void ApplyImportOptions(BoostModel &model, const ImportOptions &options) {
 		if (model.feature_names[i].empty()) {
 			model.feature_names[i] = "f" + std::to_string(i);
 		}
+	}
+	if (model.task == BoostTask::MULTICLASS && model.n_classes < 2) {
+		throw InvalidInputException("duckboost: multiclass models require n_classes >= 2");
+	}
+	if (model.task != BoostTask::MULTICLASS) {
+		model.n_classes = 1;
 	}
 }
 
@@ -285,6 +300,9 @@ ImportOptions ImportOptions::FromMap(const unordered_map<string, string> &option
 			for (auto &name : result.feature_names) {
 				StringUtil::Trim(name);
 			}
+		} else if (key == "n_classes" || key == "classes_count" || key == "num_class" || key == "num_classes") {
+			result.n_classes = static_cast<idx_t>(std::stoull(value));
+			result.n_classes_set = true;
 		} else {
 			throw InvalidInputException("duckboost: unknown import option '%s'", entry.first);
 		}
@@ -454,8 +472,9 @@ BoostModel ImportCatBoostJSON(const string &dump, const ImportOptions &options) 
 	vector<FloatFeatureInfo> float_features;
 	vector<std::pair<idx_t, double>> global_splits; // split_index → (feature, border)
 	double scale = 1.0;
-	double bias = 0.0;
+	vector<double> biases = {0.0};
 	bool has_trees = false;
+	idx_t detected_classes = 0;
 
 	struct TreeSplit {
 		idx_t feature = 0;
@@ -619,17 +638,24 @@ BoostModel ImportCatBoostJSON(const string &dump, const ImportOptions &options) 
 		} else if (key == "scale_and_bias") {
 			p.Expect('[');
 			scale = p.ParseNumber();
+			biases.clear();
 			if (p.TryConsume(',')) {
 				if (p.Peek() == '[') {
 					p.Expect('[');
-					bias = p.ParseNumber();
+					bool first_bias = true;
 					while (!p.TryConsume(']')) {
-						p.Expect(',');
-						p.SkipValue();
+						if (!first_bias) {
+							p.Expect(',');
+						}
+						first_bias = false;
+						biases.push_back(p.ParseNumber());
 					}
 				} else {
-					bias = p.ParseNumber();
+					biases.push_back(p.ParseNumber());
 				}
+			}
+			if (biases.empty()) {
+				biases.push_back(0.0);
 			}
 			p.Expect(']');
 		} else if (key == "model_info") {
@@ -654,9 +680,14 @@ BoostModel ImportCatBoostJSON(const string &dump, const ImportOptions &options) 
 						p.Expect(':');
 						if ((pk == "loss_function" || pk == "objective") && p.Peek() == '"') {
 							auto loss = StringUtil::Lower(p.ParseString());
-							if (loss.find("logloss") != string::npos || loss.find("crossentropy") != string::npos) {
+							if (loss.find("multiclass") != string::npos || loss.find("multi_class") != string::npos) {
+								model.task = BoostTask::MULTICLASS;
+							} else if (loss.find("logloss") != string::npos ||
+							           loss.find("crossentropy") != string::npos) {
 								model.task = BoostTask::BINARY;
 							}
+						} else if ((pk == "classes_count" || pk == "class_count") && p.Peek() != '"') {
+							detected_classes = static_cast<idx_t>(p.ParseNumber());
 						} else {
 							p.SkipValue();
 						}
@@ -703,21 +734,49 @@ BoostModel ImportCatBoostJSON(const string &dump, const ImportOptions &options) 
 			// CatBoost True when feature > border; duckboost left uses feature < threshold.
 			thresholds.push_back(ThresholdForLessEqual(border));
 		}
-		idx_t expected_leaves = idx_t(1) << features.size();
-		if (pending.leaf_values.size() != expected_leaves) {
-			throw NotImplementedException(
-			    "duckboost: catboost tree leaf_values size %llu != 2^depth (%llu); multiclass not supported yet",
-			    (unsigned long long)pending.leaf_values.size(), (unsigned long long)expected_leaves);
+		idx_t leaves_per_class = idx_t(1) << features.size();
+		if (leaves_per_class == 0 || pending.leaf_values.size() % leaves_per_class != 0) {
+			throw InvalidInputException(
+			    "duckboost: catboost tree leaf_values size %llu is not a positive multiple of 2^depth (%llu)",
+			    (unsigned long long)pending.leaf_values.size(), (unsigned long long)leaves_per_class);
 		}
-		for (auto &value : pending.leaf_values) {
-			value *= scale;
+		idx_t tree_classes = pending.leaf_values.size() / leaves_per_class;
+		if (tree_classes == 0) {
+			throw InvalidInputException("duckboost: catboost tree has zero classes");
 		}
-		BoostTree tree;
-		ExpandCatBoost(0, 0, features, thresholds, pending.leaf_values, tree);
-		model.trees.push_back(std::move(tree));
+		if (detected_classes == 0) {
+			detected_classes = tree_classes;
+		} else if (detected_classes != tree_classes) {
+			throw InvalidInputException("duckboost: catboost inconsistent class count across trees (%llu vs %llu)",
+			                            (unsigned long long)detected_classes, (unsigned long long)tree_classes);
+		}
+		// JSON layout: first 2^depth values for class 0, next for class 1, ...
+		for (idx_t c = 0; c < tree_classes; c++) {
+			vector<double> class_leaves(leaves_per_class);
+			for (idx_t leaf = 0; leaf < leaves_per_class; leaf++) {
+				class_leaves[leaf] = pending.leaf_values[c * leaves_per_class + leaf] * scale;
+			}
+			BoostTree tree;
+			ExpandCatBoost(0, 0, features, thresholds, class_leaves, tree);
+			model.trees.push_back(std::move(tree));
+		}
 	}
 
-	model.base_score = bias;
+	if (detected_classes >= 2) {
+		model.task = BoostTask::MULTICLASS;
+		model.n_classes = detected_classes;
+		model.base_scores = biases;
+		if (model.base_scores.size() < model.n_classes) {
+			model.base_scores.resize(model.n_classes, model.base_scores.empty() ? 0.0 : model.base_scores.back());
+		} else if (model.base_scores.size() > model.n_classes) {
+			model.base_scores.resize(model.n_classes);
+		}
+		model.base_score = model.base_scores.empty() ? 0.0 : model.base_scores[0];
+	} else {
+		model.n_classes = 1;
+		model.base_score = biases.empty() ? 0.0 : biases[0];
+		model.base_scores.clear();
+	}
 	ApplyImportOptions(model, options);
 	return model;
 }

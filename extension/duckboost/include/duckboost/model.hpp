@@ -19,7 +19,7 @@ namespace duckboost {
 
 enum class BoostBackend : uint8_t { REFERENCE = 0, XGBOOST = 1, LIGHTGBM = 2, CATBOOST = 3 };
 
-enum class BoostTask : uint8_t { REGRESSION = 0, BINARY = 1 };
+enum class BoostTask : uint8_t { REGRESSION = 0, BINARY = 1, MULTICLASS = 2 };
 
 struct TreeNode {
 	idx_t feature = 0;
@@ -39,16 +39,26 @@ struct BoostModel {
 	BoostBackend backend = BoostBackend::REFERENCE;
 	BoostTask task = BoostTask::REGRESSION;
 	double base_score = 0;
+	//! Per-class biases for multiclass; empty means use base_score for every class.
+	vector<double> base_scores;
 	double learning_rate = 0.1;
 	idx_t n_features = 0;
+	//! 1 for regression/binary; >= 2 for multiclass.
+	idx_t n_classes = 1;
 	vector<string> feature_names;
+	//! For multiclass: trees laid out as [round][class] → index round * n_classes + class.
 	vector<BoostTree> trees;
 
 	string ToJSON() const;
 	static BoostModel FromJSON(const string &json);
 
+	double ClassBias(idx_t class_idx) const;
+	double EvalTree(const BoostTree &tree, const vector<double> &features) const;
 	double PredictRaw(const vector<double> &features) const;
+	vector<double> PredictRawMulti(const vector<double> &features) const;
+	//! Regression/binary probability, or multiclass argmax class index.
 	double Predict(const vector<double> &features) const;
+	vector<double> PredictProba(const vector<double> &features) const;
 };
 
 struct TrainOptions {

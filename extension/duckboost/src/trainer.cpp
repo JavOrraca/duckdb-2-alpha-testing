@@ -398,7 +398,11 @@ double EvaluateModel(const BoostModel &model, const vector<double> &y, const vec
 	}
 	auto metric = options.metric;
 	if (metric.empty() || metric == "auto") {
-		metric = model.task == BoostTask::BINARY ? "accuracy" : "rmse";
+		if (model.task == BoostTask::BINARY || model.task == BoostTask::MULTICLASS) {
+			metric = "accuracy";
+		} else {
+			metric = "rmse";
+		}
 	}
 
 	if (metric == "rmse") {
@@ -419,7 +423,12 @@ double EvaluateModel(const BoostModel &model, const vector<double> &y, const vec
 	if (metric == "accuracy") {
 		idx_t correct = 0;
 		for (idx_t i = 0; i < y.size(); i++) {
-			auto pred = model.Predict(x[i]) >= 0.5 ? 1.0 : 0.0;
+			double pred;
+			if (model.task == BoostTask::MULTICLASS) {
+				pred = model.Predict(x[i]);
+			} else {
+				pred = model.Predict(x[i]) >= 0.5 ? 1.0 : 0.0;
+			}
 			if (pred == y[i]) {
 				correct++;
 			}
@@ -427,6 +436,19 @@ double EvaluateModel(const BoostModel &model, const vector<double> &y, const vec
 		return static_cast<double>(correct) / static_cast<double>(y.size());
 	}
 	if (metric == "logloss") {
+		if (model.task == BoostTask::MULTICLASS) {
+			double loss = 0;
+			for (idx_t i = 0; i < y.size(); i++) {
+				auto proba = model.PredictProba(x[i]);
+				auto label = static_cast<idx_t>(y[i]);
+				if (label >= proba.size()) {
+					throw InvalidInputException("duckboost: multiclass label out of range during logloss");
+				}
+				auto p = std::min(1.0 - 1e-15, std::max(1e-15, proba[label]));
+				loss += -std::log(p);
+			}
+			return loss / static_cast<double>(y.size());
+		}
 		double loss = 0;
 		for (idx_t i = 0; i < y.size(); i++) {
 			auto p = std::min(1.0 - 1e-15, std::max(1e-15, model.Predict(x[i])));

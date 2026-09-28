@@ -245,8 +245,8 @@ BoostBackend BackendFromString(const string &name) {
 	if (lower == "catboost" || lower == "cb") {
 		return BoostBackend::CATBOOST;
 	}
-	throw InvalidInputException(
-	    "duckboost: unknown backend '%s' (expected reference, xgboost, lightgbm, or catboost)", name);
+	throw InvalidInputException("duckboost: unknown backend '%s' (expected reference, xgboost, lightgbm, or catboost)",
+	                            name);
 }
 
 string TaskToString(BoostTask task) {
@@ -603,7 +603,7 @@ BoostModel BoostModel::FromJSON(const string &json) {
 							} else if (node_key == "compare") {
 								auto cmp = StringUtil::Lower(p.ParseString());
 								node.compare = (cmp == "equal" || cmp == "eq" || cmp == "==") ? SplitCompare::EQUAL
-								                                                             : SplitCompare::LESS;
+								                                                              : SplitCompare::LESS;
 							} else {
 								p.SkipValue();
 							}

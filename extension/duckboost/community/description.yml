@@ -1,11 +1,13 @@
 # Submit this file to https://github.com/duckdb/community-extensions as:
 #   extensions/duckboost/description.yml
 #
-# Prerequisites:
-#   1. Extract a standalone repo with scripts/extract_duckboost_oot.sh
-#   2. Push that repo publicly (default expectation: JavOrraca/duckboost)
-#   3. Set repo.ref below to the commit SHA you want published
-#   4. Open a PR against duckdb/community-extensions with only this file
+# Publish surface (orphan branch, do not merge into v2.0-cyanoptera):
+#   branch: cursor/duckboost-community-oot-0c09
+#   repo:   JavOrraca/duckdb-2-alpha-testing
+#
+# Refresh after re-extracting:
+#   scripts/extract_duckboost_oot.sh /tmp/duckboost_oot
+#   # push orphan branch, then update repo.ref below
 
 extension:
   name: duckboost
@@ -21,9 +23,8 @@ extension:
   requires_toolchains: "python3"
 
 repo:
-  github: JavOrraca/duckboost
-  # Replace with the commit SHA of the extracted standalone repository.
-  ref: main
+  github: JavOrraca/duckdb-2-alpha-testing
+  ref: 2bcdcae3d5fc8375b026d367da051a78416809db
 
 docs:
   hello_world: |
@@ -49,4 +50,5 @@ docs:
     Optional in-process XGBoost / LightGBM training requires rebuilding with
     `DUCKBOOST_WITH_XGBOOST` / `DUCKBOOST_WITH_LIGHTGBM`. CatBoost is import-only.
 
-    Source and packaging notes live in the extension repository (`PACKAGING.md`).
+    The community build surface is the orphan branch `cursor/duckboost-community-oot-0c09`
+    in this repository (extension-template layout). See `community/SUBMIT.md`.

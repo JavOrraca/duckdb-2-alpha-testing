@@ -52,3 +52,6 @@ seeked = "seeked"
 larg = "larg"
 rarg = "rarg"
 deliminated = "deliminated"
+
+# CatBoost model JSON uses the misspelling "prior_denomerator" as a key alias.
+denomerator = "denomerator"

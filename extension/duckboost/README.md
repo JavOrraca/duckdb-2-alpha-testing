@@ -166,4 +166,5 @@ For `task: "multiclass"`, `n_classes >= 2`, optional `base_scores` holds per-cla
 - [x] Community packaging docs (`PACKAGING.md`, local `extension_config.cmake`)
 - [x] Vendor C API bridges for XGBoost / LightGBM (train → dump → import into `BoostModel`)
 - [x] Community publish kit (`community/description.yml`, `scripts/extract_duckboost_oot.sh`, dual-mode CMake)
-- [ ] Push standalone `JavOrraca/duckboost` repo + open PR on `duckdb/community-extensions`
+- [x] Orphan publish surface `cursor/duckboost-community-oot-0c09` + submit-ready descriptor (`community/SUBMIT.md`)
+- [ ] Open PR on `duckdb/community-extensions` with `extensions/duckboost/description.yml`

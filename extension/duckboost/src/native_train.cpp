@@ -401,19 +401,18 @@ bool NativeTrainerLinked(BoostBackend backend) {
 
 BoostModel TrainNative(const vector<double> &y, const vector<vector<double>> &x, const TrainOptions &options) {
 	if (!NativeTrainerCompiled(options.backend)) {
-		throw NotImplementedException(
-		    "duckboost: native training for backend '%s' is not linked in this build. "
-		    "Configure with -DDUCKBOOST_WITH_%s=ON (and install the vendor library), "
-		    "or use backend='reference' / duckboost_import().",
-		    BackendToString(options.backend), StringUtil::Upper(BackendToString(options.backend)));
+		throw NotImplementedException("duckboost: native training for backend '%s' is not linked in this build. "
+		                              "Configure with -DDUCKBOOST_WITH_%s=ON (and install the vendor library), "
+		                              "or use backend='reference' / duckboost_import().",
+		                              BackendToString(options.backend),
+		                              StringUtil::Upper(BackendToString(options.backend)));
 	}
 
 #if defined(DUCKBOOST_NATIVE_STUB)
-	throw NotImplementedException(
-	    "duckboost: native trainer for backend '%s' is compiled as a stub "
-	    "(DUCKBOOST_NATIVE_STUB_ONLY). Rebuild with the vendor library linked, "
-	    "or use duckboost_import() / backend='reference'.",
-	    BackendToString(options.backend));
+	throw NotImplementedException("duckboost: native trainer for backend '%s' is compiled as a stub "
+	                              "(DUCKBOOST_NATIVE_STUB_ONLY). Rebuild with the vendor library linked, "
+	                              "or use duckboost_import() / backend='reference'.",
+	                              BackendToString(options.backend));
 #endif
 
 	switch (options.backend) {
@@ -437,10 +436,9 @@ BoostModel TrainNative(const vector<double> &y, const vector<vector<double>> &x,
 		break;
 	}
 
-	throw NotImplementedException(
-	    "duckboost: native trainer for backend '%s' is not available in this build. "
-	    "Use duckboost_import() or backend='reference'.",
-	    BackendToString(options.backend));
+	throw NotImplementedException("duckboost: native trainer for backend '%s' is not available in this build. "
+	                              "Use duckboost_import() or backend='reference'.",
+	                              BackendToString(options.backend));
 }
 
 } // namespace duckboost

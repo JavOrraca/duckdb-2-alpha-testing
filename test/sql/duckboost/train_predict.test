@@ -27,7 +27,7 @@ SELECT duckboost_train(
 	MAP {
 		'backend': 'reference',
 		'task': 'regression',
-		'n_estimators': '15',
+		'n_estimators': '40',
 		'max_depth': '3',
 		'learning_rate': '0.2',
 		'feature_names': 'x1,x2'

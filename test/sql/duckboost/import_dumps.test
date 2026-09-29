@@ -23,6 +23,17 @@ SELECT duckboost_predict(model, [2.0]) FROM xgb_models;
 ----
 -0.25
 
+# XGBoost dump missing=yes → NaN takes the left (yes) child
+query I
+SELECT duckboost_predict(model, ['nan'::DOUBLE]) FROM xgb_models;
+----
+0.5
+
+query I
+SELECT model LIKE '%"default_left":true%' FROM xgb_models;
+----
+true
+
 query I
 SELECT model LIKE '%"backend":"xgboost"%' FROM xgb_models;
 ----

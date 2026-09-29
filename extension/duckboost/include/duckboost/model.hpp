@@ -32,6 +32,8 @@ struct TreeNode {
 	double value = 0;
 	bool is_leaf = true;
 	SplitCompare compare = SplitCompare::LESS;
+	//! When feature is NaN/missing, take left if true else right (XGBoost-style learned default).
+	bool default_left = true;
 };
 
 struct BoostTree {
@@ -104,7 +106,24 @@ struct TrainOptions {
 	idx_t max_depth = 3;
 	double learning_rate = 0.1;
 	idx_t min_samples_leaf = 1;
-	idx_t max_bins = 16;
+	//! Min sum of hessians in a child (XGBoost min_child_weight).
+	double min_child_weight = 1.0;
+	idx_t max_bins = 256;
+	//! L2 regularization on leaf weights.
+	double reg_lambda = 1.0;
+	//! L1 regularization on leaf weights.
+	double reg_alpha = 0.0;
+	//! Minimum loss reduction required to make a split (XGBoost gamma).
+	double min_split_gain = 0.0;
+	//! Row subsample ratio per tree in (0, 1].
+	double subsample = 1.0;
+	//! Column subsample ratio per tree in (0, 1].
+	double colsample_bytree = 1.0;
+	//! Hold out this fraction of rows for early stopping (0 = disabled).
+	double validation_fraction = 0.0;
+	//! Stop if validation metric does not improve for this many rounds (0 = disabled).
+	idx_t early_stopping_rounds = 0;
+	uint64_t seed = 0;
 	vector<string> feature_names;
 
 	static TrainOptions FromMap(const unordered_map<string, string> &options);

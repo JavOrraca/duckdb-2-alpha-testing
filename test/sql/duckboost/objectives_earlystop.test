@@ -1,0 +1,187 @@
+# name: test/sql/duckboost/objectives_earlystop.test
+# description: duckboost poisson/huber/quantile objectives and early stopping
+# group: [duckboost]
+
+require duckboost
+
+# Poisson count regression: non-negative targets, predict via exp(raw)
+statement ok
+CREATE TABLE poisson_train AS
+SELECT
+	i::DOUBLE AS x1,
+	((i % 5) + 1)::DOUBLE AS y
+FROM range(60) t(i);
+
+statement ok
+CREATE TABLE poisson_models AS
+SELECT duckboost_train(
+	y,
+	[x1],
+	MAP {
+		'backend': 'reference',
+		'task': 'regression',
+		'objective': 'poisson',
+		'n_estimators': '40',
+		'max_depth': '3',
+		'learning_rate': '0.2',
+		'reg_lambda': '0.1',
+		'feature_names': 'x1'
+	}
+) AS model
+FROM poisson_train;
+
+query I
+SELECT model LIKE '%"objective":"poisson"%' FROM poisson_models;
+----
+true
+
+query I
+SELECT duckboost_predict(model, [10.0]) > 0
+FROM poisson_models;
+----
+true
+
+query I
+SELECT duckboost_evaluate_agg(m.model, t.y, [t.x1], MAP {'metric': 'rmse'}) < 2.5
+FROM poisson_models m, poisson_train t;
+----
+true
+
+# SQL export wraps poisson raw score in EXP(...)
+query I
+SELECT duckboost_to_sql(model, 'poisson_train', ['x1'], MAP {'separate_trees': 'false'})
+	ILIKE '%EXP(%'
+FROM poisson_models;
+----
+true
+
+# Huber regression
+statement ok
+CREATE TABLE huber_train AS
+SELECT
+	i::DOUBLE AS x1,
+	(0.5 * i + CASE WHEN i = 55 THEN 100 ELSE 0 END)::DOUBLE AS y
+FROM range(60) t(i);
+
+statement ok
+CREATE TABLE huber_models AS
+SELECT duckboost_train(
+	y,
+	[x1],
+	MAP {
+		'backend': 'reference',
+		'objective': 'huber',
+		'huber_delta': '1.5',
+		'n_estimators': '30',
+		'max_depth': '3',
+		'learning_rate': '0.15',
+		'feature_names': 'x1'
+	}
+) AS model
+FROM huber_train;
+
+query I
+SELECT model LIKE '%"objective":"huber"%' AND model LIKE '%"huber_delta":1.5%' FROM huber_models;
+----
+true
+
+query I
+SELECT duckboost_predict(model, [10.0]) IS NOT NULL FROM huber_models;
+----
+true
+
+# Quantile regression (high quantile should sit above mean for skewed counts)
+statement ok
+CREATE TABLE quantile_train AS
+SELECT
+	(i % 10)::DOUBLE AS x1,
+	((i % 10) + CASE WHEN i % 7 = 0 THEN 20 ELSE 0 END)::DOUBLE AS y
+FROM range(80) t(i);
+
+statement ok
+CREATE TABLE q_hi AS
+SELECT duckboost_train(
+	y, [x1],
+	MAP {
+		'objective': 'quantile',
+		'quantile_alpha': '0.9',
+		'n_estimators': '40',
+		'max_depth': '3',
+		'learning_rate': '0.15',
+		'reg_lambda': '0.1'
+	}
+) AS model
+FROM quantile_train;
+
+statement ok
+CREATE TABLE q_lo AS
+SELECT duckboost_train(
+	y, [x1],
+	MAP {
+		'objective': 'quantile',
+		'quantile_alpha': '0.1',
+		'n_estimators': '40',
+		'max_depth': '3',
+		'learning_rate': '0.15',
+		'reg_lambda': '0.1'
+	}
+) AS model
+FROM quantile_train;
+
+query I
+SELECT
+	(SELECT duckboost_predict(model, [5.0]) FROM q_hi) >
+	(SELECT duckboost_predict(model, [5.0]) FROM q_lo);
+----
+true
+
+# Legacy objective: binary still sets task
+query I
+SELECT duckboost_train(
+	y, [x1, x2],
+	MAP {'objective': 'binary', 'n_estimators': '5', 'max_depth': '2'}
+) LIKE '%"task":"binary"%'
+FROM (SELECT * FROM (VALUES (0.0, 0.0, 0.0), (1.0, 1.0, 1.0), (0.0, 0.5, 0.0), (1.0, 1.5, 1.0)) t(y, x1, x2));
+----
+true
+
+# Early stopping should keep fewer trees than n_estimators on a tiny noisy set
+statement ok
+CREATE TABLE early_train AS
+SELECT
+	i::DOUBLE AS x1,
+	((i % 2) + 0.01 * i)::DOUBLE AS y
+FROM range(40) t(i);
+
+statement ok
+CREATE TABLE early_models AS
+SELECT duckboost_train(
+	y, [x1],
+	MAP {
+		'n_estimators': '50',
+		'max_depth': '2',
+		'learning_rate': '0.3',
+		'early_stopping_rounds': '3',
+		'validation_fraction': '0.3',
+		'seed': '7'
+	}
+) AS model
+FROM early_train;
+
+query I
+SELECT length(regexp_extract_all(model, '"nodes"')) < 50 FROM early_models;
+----
+true
+
+# Invalid objective / task combinations
+statement error
+SELECT duckboost_train(y, [x1], MAP {'task': 'binary', 'objective': 'poisson', 'n_estimators': '2'})
+FROM poisson_train;
+----
+<REGEX>:.*objective 'poisson' requires task 'regression'.*
+
+statement error
+SELECT duckboost_train(y, [x1], MAP {'objective': 'quantile', 'quantile_alpha': '1.5', 'n_estimators': '2'})
+FROM poisson_train;
+----
+<REGEX>:.*quantile_alpha.*

@@ -278,6 +278,122 @@ BoostTask TaskFromString(const string &name) {
 	throw InvalidInputException("duckboost: unknown task '%s' (expected regression, binary, or multiclass)", name);
 }
 
+string ObjectiveToString(BoostObjective objective) {
+	switch (objective) {
+	case BoostObjective::SQUAREDERROR:
+		return "squarederror";
+	case BoostObjective::LOGISTIC:
+		return "logistic";
+	case BoostObjective::SOFTMAX:
+		return "softmax";
+	case BoostObjective::POISSON:
+		return "poisson";
+	case BoostObjective::HUBER:
+		return "huber";
+	case BoostObjective::QUANTILE:
+		return "quantile";
+	case BoostObjective::AUTO:
+	default:
+		return "auto";
+	}
+}
+
+BoostObjective ObjectiveFromString(const string &name) {
+	auto lower = StringUtil::Lower(name);
+	if (lower == "auto" || lower.empty()) {
+		return BoostObjective::AUTO;
+	}
+	if (lower == "squarederror" || lower == "squared_error" || lower == "mse" || lower == "l2" ||
+	    lower == "reg:squarederror") {
+		return BoostObjective::SQUAREDERROR;
+	}
+	if (lower == "logistic" || lower == "binary:logistic") {
+		return BoostObjective::LOGISTIC;
+	}
+	if (lower == "softmax" || lower == "multi:softprob" || lower == "multi:softmax") {
+		return BoostObjective::SOFTMAX;
+	}
+	if (lower == "poisson" || lower == "count:poisson") {
+		return BoostObjective::POISSON;
+	}
+	if (lower == "huber" || lower == "reg:pseudohubererror" || lower == "pseudohuber") {
+		return BoostObjective::HUBER;
+	}
+	if (lower == "quantile" || lower == "reg:quantileerror" || lower == "quantileerror") {
+		return BoostObjective::QUANTILE;
+	}
+	throw InvalidInputException(
+	    "duckboost: unknown objective '%s' (expected auto, squarederror, logistic, softmax, poisson, huber, quantile)",
+	    name);
+}
+
+BoostObjective ResolveObjective(BoostTask task, BoostObjective objective) {
+	if (objective == BoostObjective::AUTO) {
+		switch (task) {
+		case BoostTask::BINARY:
+			return BoostObjective::LOGISTIC;
+		case BoostTask::MULTICLASS:
+			return BoostObjective::SOFTMAX;
+		case BoostTask::REGRESSION:
+		default:
+			return BoostObjective::SQUAREDERROR;
+		}
+	}
+	switch (objective) {
+	case BoostObjective::LOGISTIC:
+		if (task != BoostTask::BINARY) {
+			throw InvalidInputException("duckboost: objective 'logistic' requires task 'binary'");
+		}
+		break;
+	case BoostObjective::SOFTMAX:
+		if (task != BoostTask::MULTICLASS) {
+			throw InvalidInputException("duckboost: objective 'softmax' requires task 'multiclass'");
+		}
+		break;
+	case BoostObjective::SQUAREDERROR:
+	case BoostObjective::POISSON:
+	case BoostObjective::HUBER:
+	case BoostObjective::QUANTILE:
+		if (task != BoostTask::REGRESSION) {
+			throw InvalidInputException("duckboost: objective '%s' requires task 'regression'",
+			                            ObjectiveToString(objective));
+		}
+		break;
+	case BoostObjective::AUTO:
+		break;
+	}
+	return objective;
+}
+
+BoostObjective BoostModel::ResolvedObjective() const {
+	return ResolveObjective(task, objective);
+}
+
+void AlignTaskWithObjective(TrainOptions &options) {
+	switch (options.objective) {
+	case BoostObjective::LOGISTIC:
+		options.task = BoostTask::BINARY;
+		break;
+	case BoostObjective::SOFTMAX:
+		options.task = BoostTask::MULTICLASS;
+		break;
+	case BoostObjective::SQUAREDERROR:
+	case BoostObjective::POISSON:
+	case BoostObjective::HUBER:
+	case BoostObjective::QUANTILE:
+		options.task = BoostTask::REGRESSION;
+		break;
+	case BoostObjective::AUTO:
+		break;
+	}
+}
+
+bool ObjectiveKeyIsLegacyTask(const string &name) {
+	auto lower = StringUtil::Lower(name);
+	return lower == "regression" || lower == "regressor" || lower == "binary" || lower == "classification" ||
+	       lower == "binomial" || lower == "multiclass" || lower == "multi_class" || lower == "multi-class";
+}
+
 bool BackendTrainingSupported(BoostBackend backend) {
 	if (backend == BoostBackend::REFERENCE) {
 		return true;
@@ -288,7 +404,8 @@ bool BackendTrainingSupported(BoostBackend backend) {
 string BackendCapabilityNote(BoostBackend backend) {
 	switch (backend) {
 	case BoostBackend::REFERENCE:
-		return "in-process reference GBDT (missing defaults, categoricals, multiclass, weights)";
+		return "in-process reference GBDT (poisson/huber/quantile, missing defaults, categoricals, multiclass, "
+		       "weights)";
 	case BoostBackend::XGBOOST:
 		if (NativeTrainerLinked(backend)) {
 			return "native train via XGBoost C API (dump→import); also duckboost_import dump_model JSON";
@@ -322,8 +439,21 @@ TrainOptions TrainOptions::FromMap(const unordered_map<string, string> &options)
 		auto &value = entry.second;
 		if (key == "backend") {
 			result.backend = BackendFromString(value);
-		} else if (key == "task" || key == "objective") {
+		} else if (key == "task") {
 			result.task = TaskFromString(value);
+		} else if (key == "objective") {
+			// Legacy: objective doubled as task (regression/binary/multiclass).
+			if (ObjectiveKeyIsLegacyTask(value)) {
+				result.task = TaskFromString(value);
+				result.objective = BoostObjective::AUTO;
+			} else {
+				result.objective = ObjectiveFromString(value);
+				AlignTaskWithObjective(result);
+			}
+		} else if (key == "huber_delta" || key == "delta") {
+			result.huber_delta = std::stod(value);
+		} else if (key == "quantile_alpha" || key == "quantile") {
+			result.quantile_alpha = std::stod(value);
 		} else if (key == "n_estimators" || key == "num_boost_round" || key == "iterations") {
 			result.n_estimators = static_cast<idx_t>(std::stoull(value));
 		} else if (key == "max_depth" || key == "depth") {
@@ -425,6 +555,13 @@ TrainOptions TrainOptions::FromMap(const unordered_map<string, string> &options)
 	if (result.early_stopping_rounds > 0 && result.validation_fraction == 0) {
 		result.validation_fraction = 0.2;
 	}
+	if (!(result.huber_delta > 0)) {
+		throw InvalidInputException("duckboost: huber_delta must be > 0");
+	}
+	if (!(result.quantile_alpha > 0 && result.quantile_alpha < 1.0)) {
+		throw InvalidInputException("duckboost: quantile_alpha must be in (0, 1)");
+	}
+	ResolveObjective(result.task, result.objective);
 	return result;
 }
 
@@ -469,6 +606,15 @@ string BoostModel::ToJSON() const {
 	out << "{\"duckboost_version\":" << duckboost_version;
 	out << ",\"backend\":\"" << EscapeJSON(BackendToString(backend)) << "\"";
 	out << ",\"task\":\"" << EscapeJSON(TaskToString(task)) << "\"";
+	if (objective != BoostObjective::AUTO) {
+		out << ",\"objective\":\"" << EscapeJSON(ObjectiveToString(objective)) << "\"";
+	}
+	if (objective == BoostObjective::HUBER || huber_delta != 1.0) {
+		out << ",\"huber_delta\":" << FormatDouble(huber_delta);
+	}
+	if (objective == BoostObjective::QUANTILE || quantile_alpha != 0.5) {
+		out << ",\"quantile_alpha\":" << FormatDouble(quantile_alpha);
+	}
 	out << ",\"base_score\":" << FormatDouble(base_score);
 	if (!base_scores.empty()) {
 		out << ",\"base_scores\":[";
@@ -600,6 +746,12 @@ BoostModel BoostModel::FromJSON(const string &json) {
 			model.backend = BackendFromString(p.ParseString());
 		} else if (key == "task") {
 			model.task = TaskFromString(p.ParseString());
+		} else if (key == "objective") {
+			model.objective = ObjectiveFromString(p.ParseString());
+		} else if (key == "huber_delta") {
+			model.huber_delta = p.ParseNumber();
+		} else if (key == "quantile_alpha") {
+			model.quantile_alpha = p.ParseNumber();
 		} else if (key == "base_score") {
 			model.base_score = p.ParseNumber();
 		} else if (key == "base_scores") {
@@ -940,6 +1092,9 @@ double BoostModel::Predict(const vector<double> &features) const {
 	if (task == BoostTask::BINARY) {
 		return Sigmoid(raw);
 	}
+	if (ResolvedObjective() == BoostObjective::POISSON) {
+		return std::exp(raw);
+	}
 	return raw;
 }
 
@@ -1047,14 +1202,22 @@ string ExportModelSQL(const BoostModel &model, const string &table_name, const v
 		       QuoteIdent("_duckboost_scores");
 	}
 
+	auto wrap_link = [&](const string &raw_expr) {
+		if (model.task == BoostTask::BINARY) {
+			return "1.0 / (1.0 + EXP(-(" + raw_expr + ")))";
+		}
+		if (model.ResolvedObjective() == BoostObjective::POISSON) {
+			return "EXP(" + raw_expr + ")";
+		}
+		return raw_expr;
+	};
+
 	if (!options.separate_trees) {
 		string expr = FormatDouble(model.ClassBias(0));
 		for (auto &tree : model.trees) {
 			expr += " + " + FormatDouble(model.learning_rate) + " * (" + TreeToSQL(tree, columns, 0) + ")";
 		}
-		if (model.task == BoostTask::BINARY) {
-			expr = "1.0 / (1.0 + EXP(-(" + expr + ")))";
-		}
+		expr = wrap_link(expr);
 		return "SELECT (" + expr + ") AS " + alias + " FROM " + from_sql;
 	}
 
@@ -1077,9 +1240,7 @@ string ExportModelSQL(const BoostModel &model, const string &table_name, const v
 	for (idx_t t = 0; t < model.trees.size(); t++) {
 		sum_expr += " + " + FormatDouble(model.learning_rate) + " * " + QuoteIdent("tree_" + std::to_string(t));
 	}
-	if (model.task == BoostTask::BINARY) {
-		sum_expr = "1.0 / (1.0 + EXP(-(" + sum_expr + ")))";
-	}
+	sum_expr = wrap_link(sum_expr);
 	return "SELECT (" + sum_expr + ") AS " + alias + " FROM (" + inner.str() + ") AS " + QuoteIdent("_duckboost_trees");
 }
 

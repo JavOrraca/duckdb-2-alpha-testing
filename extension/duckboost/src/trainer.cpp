@@ -613,7 +613,17 @@ unordered_set<idx_t> ResolveCatFeatures(const TrainOptions &options, idx_t n_fea
 	return cat_set;
 }
 
-double EvalMetricSingle(BoostTask task, const vector<double> &y, const vector<double> &prediction,
+double LinkedPrediction(BoostObjective objective, double raw) {
+	if (objective == BoostObjective::POISSON) {
+		return std::exp(raw);
+	}
+	if (objective == BoostObjective::LOGISTIC) {
+		return 1.0 / (1.0 + std::exp(-raw));
+	}
+	return raw;
+}
+
+double EvalMetricSingle(BoostObjective objective, const vector<double> &y, const vector<double> &prediction,
                         const vector<idx_t> &rows, const vector<double> &weights) {
 	if (rows.empty()) {
 		return std::numeric_limits<double>::infinity();
@@ -625,21 +635,80 @@ double EvalMetricSingle(BoostTask task, const vector<double> &y, const vector<do
 	if (weight_sum <= 0) {
 		return std::numeric_limits<double>::infinity();
 	}
-	if (task == BoostTask::BINARY) {
+	if (objective == BoostObjective::LOGISTIC) {
 		double loss = 0;
 		for (auto row : rows) {
-			double p = 1.0 / (1.0 + std::exp(-prediction[row]));
+			double p = LinkedPrediction(objective, prediction[row]);
 			p = std::min(1.0 - 1e-15, std::max(1e-15, p));
 			loss += weights[row] * -(y[row] * std::log(p) + (1.0 - y[row]) * std::log(1.0 - p));
 		}
 		return loss / weight_sum;
 	}
+	if (objective == BoostObjective::QUANTILE) {
+		// Pinball loss uses alpha from the model path; early-stop uses MAE on linked preds as a proxy.
+		double sae = 0;
+		for (auto row : rows) {
+			sae += weights[row] * std::fabs(LinkedPrediction(objective, prediction[row]) - y[row]);
+		}
+		return sae / weight_sum;
+	}
 	double sse = 0;
 	for (auto row : rows) {
-		auto err = prediction[row] - y[row];
+		auto err = LinkedPrediction(objective, prediction[row]) - y[row];
 		sse += weights[row] * err * err;
 	}
 	return std::sqrt(sse / weight_sum);
+}
+
+void FillGradients(BoostObjective objective, const vector<double> &y, const vector<double> &prediction,
+                   const vector<double> &weights, double huber_delta, double quantile_alpha, vector<double> &gradients,
+                   vector<double> &hessians) {
+	const idx_t n = y.size();
+	gradients.resize(n);
+	hessians.resize(n);
+	switch (objective) {
+	case BoostObjective::POISSON:
+		for (idx_t i = 0; i < n; i++) {
+			double mu = std::exp(prediction[i]);
+			mu = std::min(1e12, std::max(1e-12, mu));
+			gradients[i] = weights[i] * (mu - y[i]);
+			hessians[i] = weights[i] * std::max(mu, 1e-6);
+		}
+		break;
+	case BoostObjective::HUBER:
+		for (idx_t i = 0; i < n; i++) {
+			double err = prediction[i] - y[i];
+			if (std::fabs(err) <= huber_delta) {
+				gradients[i] = weights[i] * err;
+				hessians[i] = weights[i];
+			} else {
+				gradients[i] = weights[i] * huber_delta * (err > 0 ? 1.0 : -1.0);
+				hessians[i] = weights[i] * 1e-6;
+			}
+		}
+		break;
+	case BoostObjective::QUANTILE:
+		for (idx_t i = 0; i < n; i++) {
+			// Pinball ∂L/∂pred: -α if y >= pred else (1-α).
+			gradients[i] = weights[i] * ((y[i] >= prediction[i]) ? -quantile_alpha : (1.0 - quantile_alpha));
+			hessians[i] = weights[i];
+		}
+		break;
+	case BoostObjective::LOGISTIC:
+		for (idx_t i = 0; i < n; i++) {
+			double p = 1.0 / (1.0 + std::exp(-prediction[i]));
+			gradients[i] = weights[i] * (p - y[i]);
+			hessians[i] = weights[i] * std::max(p * (1.0 - p), 1e-6);
+		}
+		break;
+	case BoostObjective::SQUAREDERROR:
+	default:
+		for (idx_t i = 0; i < n; i++) {
+			gradients[i] = weights[i] * (prediction[i] - y[i]);
+			hessians[i] = weights[i];
+		}
+		break;
+	}
 }
 
 double EvalMetricMulti(const vector<double> &y, const vector<vector<double>> &prediction, idx_t n_classes,
@@ -699,9 +768,14 @@ BoostModel TrainReference(const vector<double> &y, const vector<vector<double>> 
 		}
 	}
 
+	auto objective = ResolveObjective(options.task, options.objective);
+
 	BoostModel model;
 	model.backend = BoostBackend::REFERENCE;
 	model.task = options.task;
+	model.objective = options.objective == BoostObjective::AUTO ? BoostObjective::AUTO : objective;
+	model.huber_delta = options.huber_delta;
+	model.quantile_alpha = options.quantile_alpha;
 	model.learning_rate = options.learning_rate;
 	model.n_features = n_features;
 	model.feature_names = options.feature_names;
@@ -822,17 +896,7 @@ BoostModel TrainReference(const vector<double> &y, const vector<vector<double>> 
 	}
 
 	vector<double> prediction(y.size(), 0);
-	if (options.task == BoostTask::REGRESSION) {
-		double sum = 0;
-		double wsum = 0;
-		for (auto row : train_rows) {
-			sum += weights[row] * y[row];
-			wsum += weights[row];
-		}
-		model.base_score = wsum > 0 ? sum / wsum : 0;
-		std::fill(prediction.begin(), prediction.end(), model.base_score);
-		model.n_classes = 1;
-	} else {
+	if (objective == BoostObjective::LOGISTIC) {
 		for (auto label : y) {
 			if (!(label == 0.0 || label == 1.0)) {
 				throw InvalidInputException("duckboost: binary task requires labels in {0, 1}");
@@ -849,23 +913,41 @@ BoostModel TrainReference(const vector<double> &y, const vector<vector<double>> 
 		model.base_score = std::log(pos / (1.0 - pos));
 		std::fill(prediction.begin(), prediction.end(), model.base_score);
 		model.n_classes = 1;
+	} else if (objective == BoostObjective::POISSON) {
+		for (auto label : y) {
+			if (!std::isfinite(label) || label < 0) {
+				throw InvalidInputException("duckboost: poisson objective requires non-negative labels");
+			}
+		}
+		double sum = 0;
+		double wsum = 0;
+		for (auto row : train_rows) {
+			sum += weights[row] * y[row];
+			wsum += weights[row];
+		}
+		double mean = wsum > 0 ? sum / wsum : 1.0;
+		mean = std::max(mean, 1e-6);
+		model.base_score = std::log(mean);
+		std::fill(prediction.begin(), prediction.end(), model.base_score);
+		model.n_classes = 1;
+	} else {
+		// Squared error / Huber / quantile: initialize at weighted mean (quantile uses mean as a stable start).
+		double sum = 0;
+		double wsum = 0;
+		for (auto row : train_rows) {
+			sum += weights[row] * y[row];
+			wsum += weights[row];
+		}
+		model.base_score = wsum > 0 ? sum / wsum : 0;
+		std::fill(prediction.begin(), prediction.end(), model.base_score);
+		model.n_classes = 1;
 	}
 
 	for (idx_t round = 0; round < options.n_estimators; round++) {
-		vector<double> gradients(y.size());
-		vector<double> hessians(y.size());
-		if (options.task == BoostTask::REGRESSION) {
-			for (idx_t i = 0; i < y.size(); i++) {
-				gradients[i] = weights[i] * (prediction[i] - y[i]);
-				hessians[i] = weights[i];
-			}
-		} else {
-			for (idx_t i = 0; i < y.size(); i++) {
-				double p = 1.0 / (1.0 + std::exp(-prediction[i]));
-				gradients[i] = weights[i] * (p - y[i]);
-				hessians[i] = weights[i] * std::max(p * (1.0 - p), 1e-6);
-			}
-		}
+		vector<double> gradients;
+		vector<double> hessians;
+		FillGradients(objective, y, prediction, weights, options.huber_delta, options.quantile_alpha, gradients,
+		              hessians);
 
 		auto grow_rows = SelectGrowRows(train_rows, options.subsample, rng);
 		auto feature_subset = SampleFeatures(n_features, options.colsample_bytree, rng);
@@ -878,7 +960,7 @@ BoostModel TrainReference(const vector<double> &y, const vector<vector<double>> 
 		model.trees.push_back(std::move(tree));
 
 		if (!valid_rows.empty()) {
-			auto metric = EvalMetricSingle(options.task, y, prediction, valid_rows, weights);
+			auto metric = EvalMetricSingle(objective, y, prediction, valid_rows, weights);
 			if (metric < best_valid - 1e-12) {
 				best_valid = metric;
 				best_rounds = model.trees.size();

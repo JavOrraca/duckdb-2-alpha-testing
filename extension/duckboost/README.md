@@ -132,7 +132,9 @@ Native XGBoost / LightGBM linking is opt-in via `DUCKBOOST_WITH_*`. Linked build
 | `n_estimators` | `10` | Boosting rounds |
 | `max_depth` | `3` | Depth-wise trees |
 | `learning_rate` | `0.1` | Shrinkage (`eta` / `lr`) |
-| `max_bins` | `256` | Quantile candidate budget for thresholds |
+| `max_bins` | `256` | Gradient-histogram bin budget for numeric splits |
+| `grow_policy` | `depth` | `depth` (depth-wise) or `leaf` / `lossguide` (leaf-wise) |
+| `max_leaves` / `num_leaves` | `0`→`31` | Leaf budget when `grow_policy=leaf` |
 | `min_samples_leaf` | `1` | Min rows per child |
 | `min_child_weight` | `1` | Min hessian sum per child |
 | `reg_lambda` / `reg_alpha` | `1` / `0` | L2 / L1 on leaf weights |
@@ -181,11 +183,10 @@ For `task: "multiclass"`, `n_classes >= 2`, optional `base_scores` holds per-cla
 
 - **Intended home**: out-of-tree community extension (heavy optional deps + ML surface area). Prototyped in-tree here for DuckDB 2.0 development.
 - **SQL export** mirrors orbital's `separate_trees` idea so DuckDB can evaluate ensemble members as independent columns.
-- **Reference trainer** is a second-order GBDT (squared error, logistic, softmax multiclass) with
-  XGBoost-style missing-value defaults, categorical EQUAL splits, sample/class weights, L1/L2/`gamma`
-  regularization, row/column subsample, and optional early stopping. It is still lighter than
-  production XGBoost/LightGBM/CatBoost, but covers the full train → evaluate → SQL path on dirty
-  tabular data.
+- **Reference trainer** is a second-order histogram GBDT (squared error, logistic, softmax) with
+  XGBoost-style missing-value defaults, categorical EQUAL splits, depth- or leaf-wise growth,
+  sample/class weights, L1/L2/`gamma`, row/column subsample, and optional early stopping. Linked
+  XGBoost/LightGBM bridges forward weights, categoricals, and leaf-wise knobs when available.
 - **Table macros** `duckboost_fit` / `duckboost_score` wrap `duckboost_train` / `duckboost_predict` with `query_table` for a compact SQL workflow.
 
 ## Roadmap

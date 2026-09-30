@@ -1,0 +1,86 @@
+# name: test/sql/duckboost/histogram_leafwise.test
+# description: gradient histogram splits and leaf-wise tree growth
+# group: [duckboost]
+
+require duckboost
+
+statement ok
+CREATE TABLE train AS
+SELECT
+	i::DOUBLE AS x1,
+	((i * 3) % 7)::DOUBLE AS x2,
+	(1.7 * i - 0.4 * ((i * 3) % 7))::DOUBLE AS y
+FROM range(80) t(i);
+
+# Depth-wise with explicit histogram bin budget still fits
+statement ok
+CREATE TABLE depth_models AS
+SELECT duckboost_train(
+	y,
+	[x1, x2],
+	MAP {
+		'backend': 'reference',
+		'task': 'regression',
+		'n_estimators': '20',
+		'max_depth': '4',
+		'max_bins': '64',
+		'grow_policy': 'depth',
+		'learning_rate': '0.2',
+		'seed': '9',
+		'feature_names': 'x1,x2'
+	}
+) AS model
+FROM train;
+
+query I
+SELECT duckboost_evaluate_agg(m.model, t.y, [t.x1, t.x2], MAP {'metric': 'rmse'}) < 2.0
+FROM depth_models m, train t;
+----
+true
+
+# Leaf-wise growth with max_leaves
+statement ok
+CREATE TABLE leaf_models AS
+SELECT duckboost_train(
+	y,
+	[x1, x2],
+	MAP {
+		'backend': 'reference',
+		'task': 'regression',
+		'n_estimators': '20',
+		'max_depth': '6',
+		'grow_policy': 'leaf',
+		'max_leaves': '16',
+		'max_bins': '64',
+		'learning_rate': '0.2',
+		'seed': '9',
+		'feature_names': 'x1,x2'
+	}
+) AS model
+FROM train;
+
+query I
+SELECT duckboost_evaluate_agg(m.model, t.y, [t.x1, t.x2], MAP {'metric': 'rmse'}) < 2.0
+FROM leaf_models m, train t;
+----
+true
+
+# Alias num_leaves / lossguide accepted
+statement ok
+SELECT duckboost_train(
+	y,
+	[x1, x2],
+	MAP {
+		'n_estimators': '5',
+		'grow_policy': 'lossguide',
+		'num_leaves': '8',
+		'max_depth': '5'
+	}
+)
+FROM train;
+
+# Invalid grow_policy rejected
+statement error
+SELECT duckboost_train(y, [x1, x2], MAP {'grow_policy': 'banana'}) FROM train;
+----
+grow_policy must be

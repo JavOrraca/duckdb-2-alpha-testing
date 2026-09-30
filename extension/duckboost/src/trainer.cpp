@@ -398,8 +398,8 @@ BoostModel TrainReference(const vector<double> &y, const vector<vector<double>> 
 			idx_t j = i + rng.Bounded(shuffled.size() - i);
 			std::swap(shuffled[i], shuffled[j]);
 		}
-		idx_t valid_n =
-		    MaxValue<idx_t>(1, static_cast<idx_t>(std::floor(options.validation_fraction * static_cast<double>(y.size()))));
+		idx_t valid_n = MaxValue<idx_t>(
+		    1, static_cast<idx_t>(std::floor(options.validation_fraction * static_cast<double>(y.size()))));
 		valid_n = MinValue<idx_t>(valid_n, y.size() - 1);
 		valid_rows.assign(shuffled.begin(), shuffled.begin() + valid_n);
 		train_rows.assign(shuffled.begin() + valid_n, shuffled.end());

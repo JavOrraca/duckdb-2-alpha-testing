@@ -1,0 +1,65 @@
+# name: test/sql/duckboost/train_categoricals.test
+# description: reference trainer EQUAL splits for categorical features
+# group: [duckboost]
+
+require duckboost
+
+# x_cat is a discrete code; y depends on exact category membership, not numeric order.
+statement ok
+CREATE TABLE train AS
+SELECT
+	(i % 4)::DOUBLE AS x_cat,
+	(i)::DOUBLE AS x_num,
+	CASE WHEN (i % 4) = 2 THEN 10.0 ELSE 0.0 END AS y
+FROM range(80) t(i);
+
+statement ok
+CREATE TABLE models AS
+SELECT duckboost_train(
+	y,
+	[x_cat, x_num],
+	MAP {
+		'backend': 'reference',
+		'task': 'regression',
+		'n_estimators': '20',
+		'max_depth': '3',
+		'learning_rate': '0.25',
+		'cat_features': '0',
+		'feature_names': 'x_cat,x_num',
+		'seed': '5'
+	}
+) AS model
+FROM train;
+
+query I
+SELECT model LIKE '%"compare":"equal"%' FROM models;
+----
+true
+
+query I
+SELECT duckboost_evaluate_agg(m.model, t.y, [t.x_cat, t.x_num], MAP {'metric': 'rmse'}) < 1.0
+FROM models m, train t;
+----
+true
+
+# Category 2 should score near 10; others near 0
+query II
+SELECT
+	duckboost_predict((SELECT model FROM models), [2.0, 50.0]) > 7.0,
+	duckboost_predict((SELECT model FROM models), [1.0, 50.0]) < 3.0;
+----
+true	true
+
+# cat_features by name also works
+statement ok
+SELECT duckboost_train(
+	y,
+	[x_cat, x_num],
+	MAP {
+		'n_estimators': '5',
+		'max_depth': '2',
+		'cat_features': 'x_cat',
+		'feature_names': 'x_cat,x_num'
+	}
+)
+FROM train;

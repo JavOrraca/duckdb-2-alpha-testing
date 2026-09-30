@@ -124,6 +124,14 @@ struct TrainOptions {
 	//! Stop if validation metric does not improve for this many rounds (0 = disabled).
 	idx_t early_stopping_rounds = 0;
 	uint64_t seed = 0;
+	//! Optional multiclass class count override (0 = infer from labels).
+	idx_t n_classes = 0;
+	//! Feature indices treated as categorical (EQUAL splits). Resolved names filled in FromMap when numeric.
+	vector<idx_t> cat_features;
+	//! Raw cat_features tokens (indices or names); resolved once feature_names are known.
+	vector<string> cat_feature_tokens;
+	//! "balanced" or comma-separated per-class multipliers; empty = none.
+	string class_weight;
 	vector<string> feature_names;
 
 	static TrainOptions FromMap(const unordered_map<string, string> &options);
@@ -148,7 +156,9 @@ BoostTask TaskFromString(const string &name);
 bool BackendTrainingSupported(BoostBackend backend);
 string BackendCapabilityNote(BoostBackend backend);
 
-BoostModel TrainModel(const vector<double> &y, const vector<vector<double>> &x, const TrainOptions &options);
+//! weights empty ⇒ unit weights. Length must match y when non-empty.
+BoostModel TrainModel(const vector<double> &y, const vector<vector<double>> &x, const TrainOptions &options,
+                      const vector<double> &weights = {});
 double EvaluateModel(const BoostModel &model, const vector<double> &y, const vector<vector<double>> &x,
                      const EvalOptions &options);
 string ExportModelSQL(const BoostModel &model, const string &table_name, const vector<string> &feature_columns,

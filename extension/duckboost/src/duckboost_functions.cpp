@@ -114,6 +114,8 @@ vector<string> ReadVarcharList(Vector &list_vector, idx_t row) {
 struct TrainDataset {
 	vector<double> y;
 	vector<vector<double>> x;
+	vector<double> weights;
+	bool has_weights = false;
 	TrainOptions options;
 	bool options_set = false;
 };
@@ -155,6 +157,31 @@ void TrainUpdate(Vector inputs[], AggregateInputData &, idx_t input_count, Vecto
 	y_vector.ToUnifiedFormat(count, y_format);
 	auto y_data = UnifiedVectorFormat::GetData<double>(y_format);
 
+	// Signatures:
+	// (y, features)
+	// (y, features, options MAP)
+	// (y, features, weight DOUBLE)
+	// (y, features, weight DOUBLE, options MAP)
+	bool has_weight = false;
+	idx_t options_arg = 0;
+	if (input_count == 3) {
+		if (inputs[2].GetType().id() == LogicalTypeId::MAP) {
+			options_arg = 2;
+		} else {
+			has_weight = true;
+		}
+	} else if (input_count >= 4) {
+		has_weight = true;
+		options_arg = 3;
+	}
+
+	UnifiedVectorFormat weight_format;
+	const double *weight_data = nullptr;
+	if (has_weight) {
+		inputs[2].ToUnifiedFormat(count, weight_format);
+		weight_data = UnifiedVectorFormat::GetData<double>(weight_format);
+	}
+
 	UnifiedVectorFormat state_format;
 	state_vector.ToUnifiedFormat(count, state_format);
 	auto states = UnifiedVectorFormat::GetData<TrainState *>(state_format);
@@ -167,12 +194,20 @@ void TrainUpdate(Vector inputs[], AggregateInputData &, idx_t input_count, Vecto
 		auto state_idx = state_format.sel->get_index(i);
 		auto &state = *states[state_idx];
 		EnsureTrainState(state);
-		if (input_count >= 3 && !state.data->options_set) {
-			state.data->options = TrainOptions::FromMap(MapVectorToOptions(inputs[2], i));
+		if (options_arg > 0 && !state.data->options_set) {
+			state.data->options = TrainOptions::FromMap(MapVectorToOptions(inputs[options_arg], i));
 			state.data->options_set = true;
 		}
 		state.data->y.push_back(y_data[y_idx]);
 		state.data->x.push_back(ReadFeatureList(x_vector, i));
+		if (has_weight) {
+			auto w_idx = weight_format.sel->get_index(i);
+			if (!weight_format.validity.RowIsValid(w_idx)) {
+				throw InvalidInputException("duckboost: sample weight cannot be NULL");
+			}
+			state.data->weights.push_back(weight_data[w_idx]);
+			state.data->has_weights = true;
+		}
 	}
 }
 
@@ -196,6 +231,10 @@ void TrainCombine(Vector &source, Vector &target, AggregateInputData &, idx_t co
 		}
 		dst.data->y.insert(dst.data->y.end(), src.data->y.begin(), src.data->y.end());
 		dst.data->x.insert(dst.data->x.end(), src.data->x.begin(), src.data->x.end());
+		if (src.data->has_weights) {
+			dst.data->weights.insert(dst.data->weights.end(), src.data->weights.begin(), src.data->weights.end());
+			dst.data->has_weights = true;
+		}
 	}
 }
 
@@ -212,15 +251,20 @@ void TrainFinalize(Vector &state_vector, AggregateFinalizeInputData &, Vector &r
 			continue;
 		}
 		auto options = state.data->options_set ? state.data->options : TrainOptions();
-		auto model = TrainModel(state.data->y, state.data->x, options);
+		const vector<double> empty_weights;
+		auto model = TrainModel(state.data->y, state.data->x, options,
+		                        state.data->has_weights ? state.data->weights : empty_weights);
 		writer.WriteValue(StringVector::AddString(result, model.ToJSON()));
 	}
 }
 
-AggregateFunction GetTrainFunction(bool with_options) {
+AggregateFunction GetTrainFunction(bool with_weight, bool with_options) {
 	auto feature_type = LogicalType::LIST(LogicalType::DOUBLE);
 	auto options_type = LogicalType::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR);
 	vector<LogicalType> args = {LogicalType::DOUBLE, feature_type};
+	if (with_weight) {
+		args.push_back(LogicalType::DOUBLE);
+	}
 	if (with_options) {
 		args.push_back(options_type);
 	}
@@ -232,8 +276,12 @@ AggregateFunction GetTrainFunction(bool with_options) {
 	fun.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
 	fun.GetSignature().GetParameter(0).SetName("y");
 	fun.GetSignature().GetParameter(1).SetName("features");
+	idx_t next = 2;
+	if (with_weight) {
+		fun.GetSignature().GetParameter(next++).SetName("weight");
+	}
 	if (with_options) {
-		fun.GetSignature().GetParameter(2).SetName("options");
+		fun.GetSignature().GetParameter(next).SetName("options");
 	}
 	return fun;
 }
@@ -670,8 +718,10 @@ void RegisterDuckBoostMacros(ExtensionLoader &loader) {
 
 void RegisterDuckBoostFunctions(ExtensionLoader &loader) {
 	AggregateFunctionSet train_set("duckboost_train");
-	train_set.AddFunction(GetTrainFunction(false));
-	train_set.AddFunction(GetTrainFunction(true));
+	train_set.AddFunction(GetTrainFunction(false, false));
+	train_set.AddFunction(GetTrainFunction(false, true));
+	train_set.AddFunction(GetTrainFunction(true, false));
+	train_set.AddFunction(GetTrainFunction(true, true));
 	loader.RegisterFunction(train_set);
 
 	ScalarFunctionSet predict_set("duckboost_predict");

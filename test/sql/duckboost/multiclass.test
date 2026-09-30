@@ -74,3 +74,46 @@ FROM mc_models m, (
 ) t;
 ----
 true
+
+# --- Reference trainer multiclass (softmax) ---
+statement ok
+CREATE TABLE mc_train AS
+SELECT
+	i::DOUBLE AS x1,
+	(i % 3)::DOUBLE AS x2,
+	(i % 3)::DOUBLE AS y
+FROM range(90) t(i);
+
+statement ok
+CREATE TABLE mc_ref_models AS
+SELECT duckboost_train(
+	y,
+	[x1, x2],
+	MAP {
+		'backend': 'reference',
+		'task': 'multiclass',
+		'n_estimators': '25',
+		'max_depth': '3',
+		'learning_rate': '0.2',
+		'seed': '3',
+		'feature_names': 'x1,x2'
+	}
+) AS model
+FROM mc_train;
+
+query I
+SELECT model LIKE '%"task":"multiclass"%' AND model LIKE '%"n_classes":3%' FROM mc_ref_models;
+----
+true
+
+query I
+SELECT duckboost_evaluate_agg(m.model, t.y, [t.x1, t.x2], MAP {'metric': 'accuracy'}) >= 0.85
+FROM mc_ref_models m, mc_train t;
+----
+true
+
+query I
+SELECT list_reduce(duckboost_predict_proba(model, [3.0, 0.0]), lambda a, b: a + b) BETWEEN 0.999 AND 1.001
+FROM mc_ref_models;
+----
+true

@@ -3,11 +3,13 @@
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/numeric_utils.hpp"
-
+#include "duckdb/common/string_util.hpp"
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <limits>
 #include <numeric>
+#include <unordered_set>
 
 namespace duckdb {
 namespace duckboost {
@@ -38,6 +40,7 @@ struct SplitCandidate {
 	double threshold = 0;
 	double gain = -std::numeric_limits<double>::infinity();
 	bool default_left = true;
+	SplitCompare compare = SplitCompare::LESS;
 };
 
 struct SimpleRng {
@@ -136,13 +139,36 @@ vector<double> CandidateThresholds(const vector<double> &sorted_present_values, 
 	return thresholds;
 }
 
+vector<double> UniquePresentValues(const vector<double> &sorted_present_values, idx_t max_bins) {
+	vector<double> unique;
+	for (auto value : sorted_present_values) {
+		if (unique.empty() || value != unique.back()) {
+			unique.push_back(value);
+		}
+	}
+	if (unique.size() <= max_bins) {
+		return unique;
+	}
+	vector<double> sampled;
+	sampled.reserve(max_bins);
+	for (idx_t b = 0; b < max_bins; b++) {
+		idx_t idx = static_cast<idx_t>((static_cast<double>(b) + 0.5) * static_cast<double>(unique.size()) /
+		                               static_cast<double>(max_bins));
+		idx = MinValue<idx_t>(idx, unique.size() - 1);
+		sampled.push_back(unique[idx]);
+	}
+	std::sort(sampled.begin(), sampled.end());
+	sampled.erase(std::unique(sampled.begin(), sampled.end()), sampled.end());
+	return sampled;
+}
+
 bool ChildFeasible(const GradStat &stat, idx_t row_count, const TrainOptions &options) {
 	return row_count >= options.min_samples_leaf && stat.h >= options.min_child_weight;
 }
 
-void ConsiderSplit(SplitCandidate &best, idx_t feature, double threshold, bool default_left, const GradStat &left,
-                   const GradStat &right, const GradStat &parent, idx_t left_rows, idx_t right_rows,
-                   const TrainOptions &options) {
+void ConsiderSplit(SplitCandidate &best, idx_t feature, double threshold, bool default_left, SplitCompare compare,
+                   const GradStat &left, const GradStat &right, const GradStat &parent, idx_t left_rows,
+                   idx_t right_rows, const TrainOptions &options) {
 	if (!ChildFeasible(left, left_rows, options) || !ChildFeasible(right, right_rows, options)) {
 		return;
 	}
@@ -152,12 +178,18 @@ void ConsiderSplit(SplitCandidate &best, idx_t feature, double threshold, bool d
 		best.feature = feature;
 		best.threshold = threshold;
 		best.default_left = default_left;
+		best.compare = compare;
 	}
+}
+
+bool FeatureIsCategorical(idx_t feature, const unordered_set<idx_t> &cat_set) {
+	return cat_set.find(feature) != cat_set.end();
 }
 
 SplitCandidate FindBestSplit(const vector<vector<double>> &x, const vector<double> &gradients,
                              const vector<double> &hessians, const vector<idx_t> &rows,
-                             const vector<idx_t> &feature_subset, const TrainOptions &options) {
+                             const vector<idx_t> &feature_subset, const unordered_set<idx_t> &cat_set,
+                             const TrainOptions &options) {
 	SplitCandidate best;
 	if (rows.size() < 2 * options.min_samples_leaf) {
 		return best;
@@ -186,6 +218,36 @@ SplitCandidate FindBestSplit(const vector<vector<double>> &x, const vector<doubl
 		for (auto row : present) {
 			present_values.push_back(x[row][f]);
 		}
+
+		if (FeatureIsCategorical(f, cat_set)) {
+			auto levels = UniquePresentValues(present_values, options.max_bins);
+			for (auto level : levels) {
+				GradStat equal_stat;
+				idx_t equal_count = 0;
+				for (auto row : present) {
+					if (x[row][f] == level) {
+						equal_stat.Add(gradients[row], hessians[row]);
+						equal_count++;
+					}
+				}
+				idx_t neq_count = present.size() - equal_count;
+				if (equal_count == 0 || neq_count == 0) {
+					continue;
+				}
+				auto neq_stat = parent.Without(equal_stat).Without(missing_stat);
+				// EQUAL: match → right, else → left (same as EvalTree / CatBoost OneHot).
+				GradStat left_m = neq_stat;
+				left_m.Add(missing_stat);
+				ConsiderSplit(best, f, level, true, SplitCompare::EQUAL, left_m, equal_stat, parent,
+				              neq_count + missing_count, equal_count, options);
+				GradStat right_m = equal_stat;
+				right_m.Add(missing_stat);
+				ConsiderSplit(best, f, level, false, SplitCompare::EQUAL, neq_stat, right_m, parent, neq_count,
+				              equal_count + missing_count, options);
+			}
+			continue;
+		}
+
 		auto thresholds = CandidateThresholds(present_values, options.max_bins);
 		if (thresholds.empty()) {
 			continue;
@@ -206,15 +268,13 @@ SplitCandidate FindBestSplit(const vector<vector<double>> &x, const vector<doubl
 				continue;
 			}
 
-			// Missing → left
 			GradStat left_m = left_present;
 			left_m.Add(missing_stat);
-			ConsiderSplit(best, f, threshold, true, left_m, right_present, parent, left_count + missing_count,
-			              right_count, options);
-			// Missing → right
+			ConsiderSplit(best, f, threshold, true, SplitCompare::LESS, left_m, right_present, parent,
+			              left_count + missing_count, right_count, options);
 			GradStat right_m = right_present;
 			right_m.Add(missing_stat);
-			ConsiderSplit(best, f, threshold, false, left_present, right_m, parent, left_count,
+			ConsiderSplit(best, f, threshold, false, SplitCompare::LESS, left_present, right_m, parent, left_count,
 			              right_count + missing_count, options);
 		}
 	}
@@ -240,6 +300,8 @@ void PartitionRows(const vector<vector<double>> &x, const vector<idx_t> &rows, c
 		bool go_left;
 		if (IsMissing(value)) {
 			go_left = split.default_left;
+		} else if (split.compare == SplitCompare::EQUAL) {
+			go_left = value != split.threshold;
 		} else {
 			go_left = value < split.threshold;
 		}
@@ -253,12 +315,12 @@ void PartitionRows(const vector<vector<double>> &x, const vector<idx_t> &rows, c
 
 idx_t BuildTree(BoostTree &tree, const vector<vector<double>> &x, const vector<double> &gradients,
                 const vector<double> &hessians, const vector<idx_t> &rows, const vector<idx_t> &feature_subset,
-                idx_t depth, const TrainOptions &options) {
+                const unordered_set<idx_t> &cat_set, idx_t depth, const TrainOptions &options) {
 	auto parent = SumStats(gradients, hessians, rows);
 	if (depth >= options.max_depth || rows.size() < 2 * options.min_samples_leaf) {
 		return BuildLeaf(tree, LeafWeight(parent, options));
 	}
-	auto split = FindBestSplit(x, gradients, hessians, rows, feature_subset, options);
+	auto split = FindBestSplit(x, gradients, hessians, rows, feature_subset, cat_set, options);
 	if (!std::isfinite(split.gain) || split.gain <= 0) {
 		return BuildLeaf(tree, LeafWeight(parent, options));
 	}
@@ -274,11 +336,13 @@ idx_t BuildTree(BoostTree &tree, const vector<vector<double>> &x, const vector<d
 	node.feature = split.feature;
 	node.threshold = split.threshold;
 	node.default_left = split.default_left;
+	node.compare = split.compare;
 	auto node_idx = tree.nodes.size();
 	tree.nodes.push_back(node);
-	tree.nodes[node_idx].left = BuildTree(tree, x, gradients, hessians, left_rows, feature_subset, depth + 1, options);
+	tree.nodes[node_idx].left =
+	    BuildTree(tree, x, gradients, hessians, left_rows, feature_subset, cat_set, depth + 1, options);
 	tree.nodes[node_idx].right =
-	    BuildTree(tree, x, gradients, hessians, right_rows, feature_subset, depth + 1, options);
+	    BuildTree(tree, x, gradients, hessians, right_rows, feature_subset, cat_set, depth + 1, options);
 	return node_idx;
 }
 
@@ -316,28 +380,6 @@ vector<idx_t> SampleFeatures(idx_t n_features, double colsample, SimpleRng &rng)
 	return all;
 }
 
-double EvalMetric(BoostTask task, const vector<double> &y, const vector<double> &prediction,
-                  const vector<idx_t> &rows) {
-	if (rows.empty()) {
-		return std::numeric_limits<double>::infinity();
-	}
-	if (task == BoostTask::BINARY) {
-		double loss = 0;
-		for (auto row : rows) {
-			double p = 1.0 / (1.0 + std::exp(-prediction[row]));
-			p = std::min(1.0 - 1e-15, std::max(1e-15, p));
-			loss += -(y[row] * std::log(p) + (1.0 - y[row]) * std::log(1.0 - p));
-		}
-		return loss / static_cast<double>(rows.size());
-	}
-	double sse = 0;
-	for (auto row : rows) {
-		auto err = prediction[row] - y[row];
-		sse += err * err;
-	}
-	return std::sqrt(sse / static_cast<double>(rows.size()));
-}
-
 double ApplyTree(const BoostTree &tree, const vector<double> &features) {
 	idx_t node_idx = 0;
 	while (true) {
@@ -348,22 +390,209 @@ double ApplyTree(const BoostTree &tree, const vector<double> &features) {
 		auto value = features[node.feature];
 		if (IsMissing(value)) {
 			node_idx = node.default_left ? node.left : node.right;
+		} else if (node.compare == SplitCompare::EQUAL) {
+			node_idx = value == node.threshold ? node.right : node.left;
 		} else {
 			node_idx = value < node.threshold ? node.left : node.right;
 		}
 	}
 }
 
-BoostModel TrainReference(const vector<double> &y, const vector<vector<double>> &x, const TrainOptions &options) {
+vector<double> NormalizeWeights(const vector<double> &y, const vector<double> &weights_in) {
+	vector<double> weights(y.size(), 1.0);
+	if (!weights_in.empty()) {
+		if (weights_in.size() != y.size()) {
+			throw InvalidInputException("duckboost: sample weight count (%llu) must match row count (%llu)",
+			                            (unsigned long long)weights_in.size(), (unsigned long long)y.size());
+		}
+		for (idx_t i = 0; i < y.size(); i++) {
+			if (!std::isfinite(weights_in[i]) || weights_in[i] < 0) {
+				throw InvalidInputException("duckboost: sample weights must be finite and >= 0");
+			}
+			weights[i] = weights_in[i];
+		}
+	}
+	return weights;
+}
+
+void ApplyClassWeights(vector<double> &weights, const vector<double> &y, const TrainOptions &options, idx_t n_classes) {
+	if (options.class_weight.empty()) {
+		return;
+	}
+	vector<double> multipliers(n_classes, 1.0);
+	auto lower = StringUtil::Lower(options.class_weight);
+	if (lower == "balanced") {
+		vector<double> counts(n_classes, 0);
+		double total = 0;
+		for (idx_t i = 0; i < y.size(); i++) {
+			auto label = static_cast<idx_t>(y[i]);
+			if (label >= n_classes) {
+				continue;
+			}
+			counts[label] += weights[i];
+			total += weights[i];
+		}
+		for (idx_t c = 0; c < n_classes; c++) {
+			if (counts[c] <= 0) {
+				multipliers[c] = 0;
+			} else {
+				multipliers[c] = total / (static_cast<double>(n_classes) * counts[c]);
+			}
+		}
+	} else {
+		auto parts = StringUtil::Split(options.class_weight, ',');
+		if (parts.size() != n_classes) {
+			throw InvalidInputException("duckboost: class_weight list length (%llu) must match n_classes (%llu)",
+			                            (unsigned long long)parts.size(), (unsigned long long)n_classes);
+		}
+		for (idx_t c = 0; c < n_classes; c++) {
+			StringUtil::Trim(parts[c]);
+			multipliers[c] = std::stod(parts[c]);
+			if (!(multipliers[c] >= 0) || !std::isfinite(multipliers[c])) {
+				throw InvalidInputException("duckboost: class_weight values must be finite and >= 0");
+			}
+		}
+	}
+	for (idx_t i = 0; i < y.size(); i++) {
+		auto label = static_cast<idx_t>(y[i]);
+		if (label < n_classes) {
+			weights[i] *= multipliers[label];
+		}
+	}
+}
+
+idx_t InferNClasses(const vector<double> &y, const TrainOptions &options) {
+	if (options.n_classes >= 2) {
+		return options.n_classes;
+	}
+	double max_label = -1;
+	for (auto v : y) {
+		if (!std::isfinite(v) || v < 0 || std::floor(v) != v) {
+			throw InvalidInputException(
+			    "duckboost: multiclass labels must be finite non-negative integer class indices");
+		}
+		max_label = MaxValue(max_label, v);
+	}
+	auto inferred = static_cast<idx_t>(max_label) + 1;
+	if (inferred < 2) {
+		throw InvalidInputException("duckboost: multiclass train requires at least 2 classes");
+	}
+	return inferred;
+}
+
+unordered_set<idx_t> ResolveCatFeatures(const TrainOptions &options, idx_t n_features,
+                                        const vector<string> &feature_names) {
+	unordered_set<idx_t> cat_set;
+	for (auto idx : options.cat_features) {
+		if (idx >= n_features) {
+			throw InvalidInputException("duckboost: cat_features index %llu out of range for %llu features",
+			                            (unsigned long long)idx, (unsigned long long)n_features);
+		}
+		cat_set.insert(idx);
+	}
+	for (auto &token : options.cat_feature_tokens) {
+		bool all_digits = !token.empty() && std::isdigit(static_cast<unsigned char>(token[0]));
+		for (idx_t i = 1; all_digits && i < token.size(); i++) {
+			if (!std::isdigit(static_cast<unsigned char>(token[i]))) {
+				all_digits = false;
+			}
+		}
+		if (all_digits) {
+			continue; // already in cat_features
+		}
+		bool found = false;
+		for (idx_t i = 0; i < feature_names.size(); i++) {
+			if (StringUtil::Lower(feature_names[i]) == StringUtil::Lower(token)) {
+				cat_set.insert(i);
+				found = true;
+				break;
+			}
+		}
+		if (!found) {
+			throw InvalidInputException("duckboost: cat_features name '%s' not found in feature_names", token);
+		}
+	}
+	return cat_set;
+}
+
+double EvalMetricSingle(BoostTask task, const vector<double> &y, const vector<double> &prediction,
+                        const vector<idx_t> &rows, const vector<double> &weights) {
+	if (rows.empty()) {
+		return std::numeric_limits<double>::infinity();
+	}
+	double weight_sum = 0;
+	for (auto row : rows) {
+		weight_sum += weights[row];
+	}
+	if (weight_sum <= 0) {
+		return std::numeric_limits<double>::infinity();
+	}
+	if (task == BoostTask::BINARY) {
+		double loss = 0;
+		for (auto row : rows) {
+			double p = 1.0 / (1.0 + std::exp(-prediction[row]));
+			p = std::min(1.0 - 1e-15, std::max(1e-15, p));
+			loss += weights[row] * -(y[row] * std::log(p) + (1.0 - y[row]) * std::log(1.0 - p));
+		}
+		return loss / weight_sum;
+	}
+	double sse = 0;
+	for (auto row : rows) {
+		auto err = prediction[row] - y[row];
+		sse += weights[row] * err * err;
+	}
+	return std::sqrt(sse / weight_sum);
+}
+
+double EvalMetricMulti(const vector<double> &y, const vector<vector<double>> &prediction, idx_t n_classes,
+                       const vector<idx_t> &rows, const vector<double> &weights) {
+	if (rows.empty()) {
+		return std::numeric_limits<double>::infinity();
+	}
+	double weight_sum = 0;
+	double loss = 0;
+	for (auto row : rows) {
+		weight_sum += weights[row];
+		double max_score = prediction[row][0];
+		for (idx_t c = 1; c < n_classes; c++) {
+			max_score = MaxValue(max_score, prediction[row][c]);
+		}
+		double sum_exp = 0;
+		for (idx_t c = 0; c < n_classes; c++) {
+			sum_exp += std::exp(prediction[row][c] - max_score);
+		}
+		auto label = static_cast<idx_t>(y[row]);
+		auto p = std::exp(prediction[row][label] - max_score) / sum_exp;
+		p = std::min(1.0 - 1e-15, std::max(1e-15, p));
+		loss += weights[row] * -std::log(p);
+	}
+	if (weight_sum <= 0) {
+		return std::numeric_limits<double>::infinity();
+	}
+	return loss / weight_sum;
+}
+
+vector<idx_t> SelectGrowRows(const vector<idx_t> &train_rows, double subsample, SimpleRng &rng) {
+	if (subsample >= 1.0) {
+		return train_rows;
+	}
+	auto bag = SampleRows(train_rows.size(), subsample, rng);
+	vector<idx_t> grow_rows;
+	grow_rows.reserve(bag.size());
+	for (auto idx : bag) {
+		grow_rows.push_back(train_rows[idx]);
+	}
+	std::sort(grow_rows.begin(), grow_rows.end());
+	return grow_rows;
+}
+
+BoostModel TrainReference(const vector<double> &y, const vector<vector<double>> &x, const TrainOptions &options,
+                          const vector<double> &weights_in) {
 	if (y.size() != x.size()) {
 		throw InvalidInputException("duckboost: y/x row count mismatch");
 	}
 	if (y.empty()) {
 		throw InvalidInputException("duckboost: cannot train on empty dataset");
-	}
-	if (options.task == BoostTask::MULTICLASS) {
-		throw NotImplementedException(
-		    "duckboost: reference trainer does not yet support multiclass; use duckboost_import or a native backend");
 	}
 	idx_t n_features = x[0].size();
 	for (auto &row : x) {
@@ -387,6 +616,9 @@ BoostModel TrainReference(const vector<double> &y, const vector<vector<double>> 
 		                            (unsigned long long)model.feature_names.size(), (unsigned long long)n_features);
 	}
 
+	auto weights = NormalizeWeights(y, weights_in);
+	auto cat_set = ResolveCatFeatures(options, n_features, model.feature_names);
+
 	SimpleRng rng(options.seed);
 	vector<idx_t> all_rows(y.size());
 	std::iota(all_rows.begin(), all_rows.end(), 0);
@@ -407,14 +639,101 @@ BoostModel TrainReference(const vector<double> &y, const vector<vector<double>> 
 		std::sort(valid_rows.begin(), valid_rows.end());
 	}
 
+	double best_valid = std::numeric_limits<double>::infinity();
+	idx_t best_rounds = 0;
+	idx_t rounds_since_improve = 0;
+
+	if (options.task == BoostTask::MULTICLASS) {
+		idx_t n_classes = InferNClasses(y, options);
+		for (auto label : y) {
+			if (static_cast<idx_t>(label) >= n_classes) {
+				throw InvalidInputException("duckboost: multiclass label %g >= n_classes %llu", label,
+				                            (unsigned long long)n_classes);
+			}
+		}
+		model.n_classes = n_classes;
+		ApplyClassWeights(weights, y, options, n_classes);
+
+		vector<double> class_weight_sum(n_classes, 0);
+		double total_w = 0;
+		for (auto row : train_rows) {
+			auto label = static_cast<idx_t>(y[row]);
+			class_weight_sum[label] += weights[row];
+			total_w += weights[row];
+		}
+		model.base_scores.assign(n_classes, 0);
+		for (idx_t c = 0; c < n_classes; c++) {
+			auto prior = class_weight_sum[c] / MaxValue(total_w, 1e-12);
+			prior = std::min(1.0 - 1e-6, std::max(1e-6, prior));
+			model.base_scores[c] = std::log(prior);
+		}
+		model.base_score = model.base_scores[0];
+
+		vector<vector<double>> prediction(y.size(), model.base_scores);
+		for (idx_t round = 0; round < options.n_estimators; round++) {
+			auto grow_rows = SelectGrowRows(train_rows, options.subsample, rng);
+			auto feature_subset = SampleFeatures(n_features, options.colsample_bytree, rng);
+			for (idx_t c = 0; c < n_classes; c++) {
+				vector<double> gradients(y.size());
+				vector<double> hessians(y.size());
+				for (idx_t i = 0; i < y.size(); i++) {
+					double max_score = prediction[i][0];
+					for (idx_t k = 1; k < n_classes; k++) {
+						max_score = MaxValue(max_score, prediction[i][k]);
+					}
+					double sum_exp = 0;
+					for (idx_t k = 0; k < n_classes; k++) {
+						sum_exp += std::exp(prediction[i][k] - max_score);
+					}
+					double p = std::exp(prediction[i][c] - max_score) / sum_exp;
+					double target = (static_cast<idx_t>(y[i]) == c) ? 1.0 : 0.0;
+					gradients[i] = weights[i] * (p - target);
+					hessians[i] = weights[i] * std::max(p * (1.0 - p), 1e-6);
+				}
+				BoostTree tree;
+				BuildTree(tree, x, gradients, hessians, grow_rows, feature_subset, cat_set, 0, options);
+				for (idx_t i = 0; i < y.size(); i++) {
+					prediction[i][c] += options.learning_rate * ApplyTree(tree, x[i]);
+				}
+				model.trees.push_back(std::move(tree));
+			}
+			if (!valid_rows.empty()) {
+				auto metric = EvalMetricMulti(y, prediction, n_classes, valid_rows, weights);
+				if (metric < best_valid - 1e-12) {
+					best_valid = metric;
+					best_rounds = round + 1;
+					rounds_since_improve = 0;
+				} else {
+					rounds_since_improve++;
+					if (rounds_since_improve >= options.early_stopping_rounds) {
+						break;
+					}
+				}
+			}
+		}
+		if (!valid_rows.empty() && best_rounds > 0 && best_rounds * n_classes < model.trees.size()) {
+			model.trees.resize(best_rounds * n_classes);
+		}
+		return model;
+	}
+
+	if (options.task == BoostTask::BINARY) {
+		ApplyClassWeights(weights, y, options, 2);
+	} else if (!options.class_weight.empty()) {
+		throw InvalidInputException("duckboost: class_weight is only supported for binary and multiclass tasks");
+	}
+
 	vector<double> prediction(y.size(), 0);
 	if (options.task == BoostTask::REGRESSION) {
 		double sum = 0;
+		double wsum = 0;
 		for (auto row : train_rows) {
-			sum += y[row];
+			sum += weights[row] * y[row];
+			wsum += weights[row];
 		}
-		model.base_score = sum / static_cast<double>(train_rows.size());
+		model.base_score = wsum > 0 ? sum / wsum : 0;
 		std::fill(prediction.begin(), prediction.end(), model.base_score);
+		model.n_classes = 1;
 	} else {
 		for (auto label : y) {
 			if (!(label == 0.0 || label == 1.0)) {
@@ -422,61 +741,49 @@ BoostModel TrainReference(const vector<double> &y, const vector<vector<double>> 
 			}
 		}
 		double pos = 0;
+		double wsum = 0;
 		for (auto row : train_rows) {
-			pos += y[row];
+			pos += weights[row] * y[row];
+			wsum += weights[row];
 		}
-		pos /= static_cast<double>(train_rows.size());
+		pos = wsum > 0 ? pos / wsum : 0.5;
 		pos = std::min(1.0 - 1e-6, std::max(1e-6, pos));
 		model.base_score = std::log(pos / (1.0 - pos));
 		std::fill(prediction.begin(), prediction.end(), model.base_score);
+		model.n_classes = 1;
 	}
-
-	double best_valid = std::numeric_limits<double>::infinity();
-	idx_t best_trees = 0;
-	idx_t rounds_since_improve = 0;
 
 	for (idx_t round = 0; round < options.n_estimators; round++) {
 		vector<double> gradients(y.size());
 		vector<double> hessians(y.size());
 		if (options.task == BoostTask::REGRESSION) {
 			for (idx_t i = 0; i < y.size(); i++) {
-				gradients[i] = prediction[i] - y[i];
-				hessians[i] = 1.0;
+				gradients[i] = weights[i] * (prediction[i] - y[i]);
+				hessians[i] = weights[i];
 			}
 		} else {
 			for (idx_t i = 0; i < y.size(); i++) {
 				double p = 1.0 / (1.0 + std::exp(-prediction[i]));
-				gradients[i] = p - y[i];
-				hessians[i] = std::max(p * (1.0 - p), 1e-6);
+				gradients[i] = weights[i] * (p - y[i]);
+				hessians[i] = weights[i] * std::max(p * (1.0 - p), 1e-6);
 			}
 		}
 
-		auto bag_rows = SampleRows(train_rows.size(), options.subsample, rng);
-		// Remap bag indices into train_rows positions when subsample < 1 on the train subset.
-		vector<idx_t> grow_rows;
-		grow_rows.reserve(bag_rows.size());
-		if (options.subsample >= 1.0) {
-			grow_rows = train_rows;
-		} else {
-			for (auto idx : bag_rows) {
-				grow_rows.push_back(train_rows[idx]);
-			}
-			std::sort(grow_rows.begin(), grow_rows.end());
-		}
+		auto grow_rows = SelectGrowRows(train_rows, options.subsample, rng);
 		auto feature_subset = SampleFeatures(n_features, options.colsample_bytree, rng);
 
 		BoostTree tree;
-		BuildTree(tree, x, gradients, hessians, grow_rows, feature_subset, 0, options);
+		BuildTree(tree, x, gradients, hessians, grow_rows, feature_subset, cat_set, 0, options);
 		for (idx_t i = 0; i < y.size(); i++) {
 			prediction[i] += options.learning_rate * ApplyTree(tree, x[i]);
 		}
 		model.trees.push_back(std::move(tree));
 
 		if (!valid_rows.empty()) {
-			auto metric = EvalMetric(options.task, y, prediction, valid_rows);
+			auto metric = EvalMetricSingle(options.task, y, prediction, valid_rows, weights);
 			if (metric < best_valid - 1e-12) {
 				best_valid = metric;
-				best_trees = model.trees.size();
+				best_rounds = model.trees.size();
 				rounds_since_improve = 0;
 			} else {
 				rounds_since_improve++;
@@ -487,17 +794,18 @@ BoostModel TrainReference(const vector<double> &y, const vector<vector<double>> 
 		}
 	}
 
-	if (!valid_rows.empty() && best_trees > 0 && best_trees < model.trees.size()) {
-		model.trees.resize(best_trees);
+	if (!valid_rows.empty() && best_rounds > 0 && best_rounds < model.trees.size()) {
+		model.trees.resize(best_rounds);
 	}
 	return model;
 }
 
 } // namespace
 
-BoostModel TrainModel(const vector<double> &y, const vector<vector<double>> &x, const TrainOptions &options) {
+BoostModel TrainModel(const vector<double> &y, const vector<vector<double>> &x, const TrainOptions &options,
+                      const vector<double> &weights) {
 	if (options.backend == BoostBackend::REFERENCE) {
-		return TrainReference(y, x, options);
+		return TrainReference(y, x, options, weights);
 	}
 	if (NativeTrainerCompiled(options.backend)) {
 		return TrainNative(y, x, options);

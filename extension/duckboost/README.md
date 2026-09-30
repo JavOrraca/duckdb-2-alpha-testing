@@ -148,6 +148,10 @@ Native XGBoost / LightGBM linking is opt-in via `DUCKBOOST_WITH_*`. Linked build
 | `seed` | `0` | RNG seed for sampling / valid split |
 | `n_classes` | inferred | Multiclass class count override |
 | `cat_features` | _(none)_ | Comma-separated indices or `feature_names` for EQUAL splits |
+| `ctr_types` | _(none)_ | `Borders` and/or `Counter` on `cat_features` (train-time OnlineCtr) |
+| `ctr_prior` | `0.5` or `0.5,1` | Prior numerator[, denominator] for CTR smoothing |
+| `ctr_scale` / `ctr_shift` | `1` / `0` | CTR affine transform (Counter defaults scale to 15 when unset) |
+| `ctr_target_leakage` | `leave_one_out` | Borders only: `leave_one_out`, `expanding`, or `none` |
 | `class_weight` | _(none)_ | `balanced` or comma-separated per-class multipliers |
 
 Optional sample weights: `duckboost_train(y, features, weight [, options])`.
@@ -161,6 +165,8 @@ SELECT duckboost_evaluate_agg(model, y, [f1, f2], qid, MAP {'metric': 'ndcg'}) F
 ```
 
 `duckboost_predict` returns a raw ranking score (higher = more relevant). Early stopping keeps whole queries in train or valid.
+
+Train-time CTRs (`ctr_types` + `cat_features`) expand the matrix with CatBoost-style Counter/Borders features before boosting; predict/SQL reuse the same `ctr_features` path as dump import.
 
 SQL `NULL` and IEEE NaN in feature lists are treated as missing. The reference trainer learns a per-split default direction (serialized as `default_left`), matching XGBoost’s missing-child behavior. Target `y` must still be non-NULL. Multiclass uses softmax (`task: multiclass`); categorical columns use `compare: equal` splits. Poisson predictions / SQL export apply `exp(raw)`; Huber and quantile keep the raw score as the mean/quantile estimate.
 
@@ -198,10 +204,11 @@ For `task: "multiclass"`, `n_classes >= 2`, optional `base_scores` holds per-cla
 - **Intended home**: out-of-tree community extension (heavy optional deps + ML surface area). Prototyped in-tree here for DuckDB 2.0 development.
 - **SQL export** mirrors orbital's `separate_trees` idea so DuckDB can evaluate ensemble members as independent columns.
 - **Reference trainer** is a second-order histogram GBDT (squared error, logistic, softmax, poisson,
-  huber, quantile, lambdarank/pairwise) with XGBoost-style missing-value defaults, categorical EQUAL
-  splits, depth- or leaf-wise growth, sample/class weights, L1/L2/`gamma`, row/column subsample, and
-  optional early stopping. Linked XGBoost/LightGBM bridges forward objectives (including ranking
-  groups), early stopping, weights, categoricals, and leaf-wise knobs when available.
+  huber, quantile, lambdarank/pairwise) with optional train-time CatBoost-style CTR expansion,
+  XGBoost-style missing-value defaults, categorical EQUAL splits, depth- or leaf-wise growth,
+  sample/class weights, L1/L2/`gamma`, row/column subsample, and optional early stopping. Linked
+  XGBoost/LightGBM bridges forward objectives (including ranking groups), early stopping, weights,
+  categoricals, and leaf-wise knobs when available.
 - **Table macros** `duckboost_fit` / `duckboost_score` wrap `duckboost_train` / `duckboost_predict` with `query_table` for a compact SQL workflow.
 
 ## Roadmap

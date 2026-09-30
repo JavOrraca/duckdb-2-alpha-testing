@@ -965,17 +965,226 @@ void FillLambdaRankGradients(BoostObjective objective, const vector<double> &y, 
 	}
 }
 
-BoostModel TrainReference(const vector<double> &y, const vector<vector<double>> &x, const TrainOptions &options,
+vector<string> ParseCtrTypes(const string &raw) {
+	vector<string> types;
+	auto parts = StringUtil::Split(raw, ',');
+	for (auto &part : parts) {
+		StringUtil::Trim(part);
+		if (part.empty()) {
+			continue;
+		}
+		auto lower = StringUtil::Lower(part);
+		if (lower == "borders" || lower == "border" || lower == "buckets") {
+			types.push_back("Borders");
+		} else if (lower == "counter" || lower == "featurefreq" || lower == "freq") {
+			types.push_back("Counter");
+		} else {
+			throw InvalidInputException("duckboost: unknown ctr_types token '%s' (expected Borders or Counter)", part);
+		}
+	}
+	return types;
+}
+
+void FillCtrHashTables(CtrFeatureSpec &spec, const vector<double> &y, const vector<vector<double>> &x,
+                       const vector<idx_t> &train_rows, const vector<double> &weights, idx_t cat_idx, bool is_borders) {
+	unordered_map<uint64_t, int64_t> primary;
+	unordered_map<uint64_t, int64_t> secondary;
+	double weight_sum = 0;
+	for (auto row : train_rows) {
+		auto key = FeatureHashU64(x[row][cat_idx]);
+		weight_sum += weights[row];
+		if (is_borders) {
+			if (y[row] >= 0.5) {
+				secondary[key] += 1;
+			} else {
+				primary[key] += 1;
+			}
+		} else {
+			primary[key] += 1;
+		}
+	}
+	spec.hash_keys.clear();
+	spec.hash_values.clear();
+	spec.hash_values_alt.clear();
+	spec.hash_keys.reserve(primary.size() + secondary.size());
+	if (is_borders) {
+		unordered_map<uint64_t, bool> seen;
+		for (auto &entry : primary) {
+			spec.hash_keys.push_back(entry.first);
+			spec.hash_values.push_back(entry.second);
+			spec.hash_values_alt.push_back(secondary[entry.first]);
+			seen[entry.first] = true;
+		}
+		for (auto &entry : secondary) {
+			if (seen[entry.first]) {
+				continue;
+			}
+			spec.hash_keys.push_back(entry.first);
+			spec.hash_values.push_back(0);
+			spec.hash_values_alt.push_back(entry.second);
+		}
+	} else {
+		for (auto &entry : primary) {
+			spec.hash_keys.push_back(entry.first);
+			spec.hash_values.push_back(entry.second);
+		}
+		spec.counter_denominator = static_cast<int64_t>(std::llround(weight_sum > 0 ? weight_sum : train_rows.size()));
+	}
+}
+
+double CtrValueForRow(const CtrFeatureSpec &spec, const vector<double> &raw_row,
+                      const unordered_map<uint64_t, idx_t> &lookup, bool is_borders, CtrTargetLeakage leakage,
+                      double label) {
+	auto key = CombineCtrHash(spec, raw_row);
+	int64_t primary = 0;
+	int64_t secondary = 0;
+	auto it = lookup.find(key);
+	if (it != lookup.end()) {
+		primary = spec.hash_values[it->second];
+		if (it->second < spec.hash_values_alt.size()) {
+			secondary = spec.hash_values_alt[it->second];
+		}
+	}
+	if (is_borders && leakage == CtrTargetLeakage::LEAVE_ONE_OUT) {
+		if (label >= 0.5) {
+			secondary = MaxValue<int64_t>(0, secondary - 1);
+		} else {
+			primary = MaxValue<int64_t>(0, primary - 1);
+		}
+	}
+	return CtrValueFromCounts(spec, primary, secondary);
+}
+
+vector<vector<double>> ExpandFeaturesWithCtr(BoostModel &model, const vector<double> &y,
+                                             const vector<vector<double>> &x, const vector<idx_t> &train_rows,
+                                             const vector<double> &weights, const unordered_set<idx_t> &cat_set,
+                                             const TrainOptions &options) {
+	auto types = ParseCtrTypes(options.ctr_types);
+	if (types.empty()) {
+		model.n_raw_features = x[0].size();
+		return x;
+	}
+	if (cat_set.empty()) {
+		throw InvalidInputException("duckboost: ctr_types requires cat_features");
+	}
+	const bool need_binary = std::any_of(types.begin(), types.end(), [](const string &t) { return t == "Borders"; });
+	if (need_binary) {
+		if (options.task != BoostTask::BINARY &&
+		    ResolveObjective(options.task, options.objective) != BoostObjective::LOGISTIC) {
+			throw InvalidInputException("duckboost: Borders CTR requires task 'binary'");
+		}
+		for (auto row : train_rows) {
+			if (!(y[row] == 0.0 || y[row] == 1.0)) {
+				throw InvalidInputException("duckboost: Borders CTR requires labels in {0, 1}");
+			}
+		}
+	}
+
+	vector<idx_t> cats(cat_set.begin(), cat_set.end());
+	std::sort(cats.begin(), cats.end());
+
+	const idx_t n_raw = x[0].size();
+	model.n_raw_features = n_raw;
+	model.n_features = n_raw;
+	model.ctr_features.clear();
+
+	vector<vector<double>> expanded = x;
+	for (auto &row : expanded) {
+		row.resize(n_raw);
+	}
+
+	for (auto cat_idx : cats) {
+		for (auto &type : types) {
+			CtrFeatureSpec spec;
+			spec.feature_index = model.n_features++;
+			spec.ctr_type = type;
+			spec.prior_numerator = options.ctr_prior_numerator;
+			spec.prior_denominator = options.ctr_prior_denominator;
+			spec.scale = type == "Counter" && options.ctr_scale == 1.0 ? 15.0 : options.ctr_scale;
+			spec.shift = options.ctr_shift;
+			CtrCombineElement element;
+			element.kind = CtrElementKind::CAT_FEATURE_VALUE;
+			element.feature_index = cat_idx;
+			spec.elements.push_back(element);
+			spec.cat_feature_indices.push_back(cat_idx);
+
+			const bool is_borders = type == "Borders";
+			if (options.ctr_target_leakage == CtrTargetLeakage::EXPANDING && is_borders) {
+				// Expanding: fill row values from prefix counts; store full-train tables for predict.
+				unordered_map<uint64_t, int64_t> fail;
+				unordered_map<uint64_t, int64_t> success;
+				vector<idx_t> order = train_rows;
+				std::sort(order.begin(), order.end());
+				unordered_map<idx_t, double> train_ctr;
+				for (auto row : order) {
+					auto key = FeatureHashU64(x[row][cat_idx]);
+					train_ctr[row] = CtrValueFromCounts(spec, fail[key], success[key]);
+					if (y[row] >= 0.5) {
+						success[key] += 1;
+					} else {
+						fail[key] += 1;
+					}
+				}
+				FillCtrHashTables(spec, y, x, train_rows, weights, cat_idx, true);
+				unordered_map<uint64_t, idx_t> lookup;
+				for (idx_t i = 0; i < spec.hash_keys.size(); i++) {
+					lookup[spec.hash_keys[i]] = i;
+				}
+				for (auto &row : expanded) {
+					row.resize(model.n_features, 0);
+				}
+				for (idx_t i = 0; i < y.size(); i++) {
+					auto it = train_ctr.find(i);
+					if (it != train_ctr.end()) {
+						expanded[i][spec.feature_index] = it->second;
+					} else {
+						expanded[i][spec.feature_index] =
+						    CtrValueForRow(spec, x[i], lookup, true, CtrTargetLeakage::NONE, y[i]);
+					}
+				}
+			} else {
+				FillCtrHashTables(spec, y, x, train_rows, weights, cat_idx, is_borders);
+				unordered_map<uint64_t, idx_t> lookup;
+				for (idx_t i = 0; i < spec.hash_keys.size(); i++) {
+					lookup[spec.hash_keys[i]] = i;
+				}
+				for (auto &row : expanded) {
+					row.resize(model.n_features, 0);
+				}
+				for (idx_t i = 0; i < y.size(); i++) {
+					auto leakage = is_borders ? options.ctr_target_leakage : CtrTargetLeakage::NONE;
+					// Valid / non-train rows use full train tables (no LOO).
+					bool in_train = false;
+					// train_rows is sorted; binary search
+					in_train = std::binary_search(train_rows.begin(), train_rows.end(), i);
+					if (!in_train) {
+						leakage = CtrTargetLeakage::NONE;
+					}
+					expanded[i][spec.feature_index] = CtrValueForRow(spec, x[i], lookup, is_borders, leakage, y[i]);
+				}
+			}
+			model.ctr_features.push_back(std::move(spec));
+		}
+	}
+
+	// Append synthetic feature names for tree debugging / SQL.
+	while (model.feature_names.size() < model.n_features) {
+		model.feature_names.push_back("_duckboost_ctr_" + std::to_string(model.feature_names.size()));
+	}
+	return expanded;
+}
+
+BoostModel TrainReference(const vector<double> &y, const vector<vector<double>> &x_in, const TrainOptions &options,
                           const vector<double> &weights_in, const vector<int64_t> &groups) {
-	if (y.size() != x.size()) {
+	if (y.size() != x_in.size()) {
 		throw InvalidInputException("duckboost: y/x row count mismatch");
 	}
 	if (y.empty()) {
 		throw InvalidInputException("duckboost: cannot train on empty dataset");
 	}
-	idx_t n_features = x[0].size();
-	for (auto &row : x) {
-		if (row.size() != n_features) {
+	idx_t n_raw_features = x_in[0].size();
+	for (auto &row : x_in) {
+		if (row.size() != n_raw_features) {
 			throw InvalidInputException("duckboost: jagged feature rows are not supported");
 		}
 	}
@@ -989,19 +1198,20 @@ BoostModel TrainReference(const vector<double> &y, const vector<vector<double>> 
 	model.huber_delta = options.huber_delta;
 	model.quantile_alpha = options.quantile_alpha;
 	model.learning_rate = options.learning_rate;
-	model.n_features = n_features;
+	model.n_features = n_raw_features;
+	model.n_raw_features = n_raw_features;
 	model.feature_names = options.feature_names;
 	if (model.feature_names.empty()) {
-		for (idx_t i = 0; i < n_features; i++) {
+		for (idx_t i = 0; i < n_raw_features; i++) {
 			model.feature_names.push_back("f" + std::to_string(i));
 		}
-	} else if (model.feature_names.size() != n_features) {
+	} else if (model.feature_names.size() != n_raw_features) {
 		throw InvalidInputException("duckboost: feature_names count (%llu) must match feature width (%llu)",
-		                            (unsigned long long)model.feature_names.size(), (unsigned long long)n_features);
+		                            (unsigned long long)model.feature_names.size(), (unsigned long long)n_raw_features);
 	}
 
 	auto weights = NormalizeWeights(y, weights_in);
-	auto cat_set = ResolveCatFeatures(options, n_features, model.feature_names);
+	auto cat_set = ResolveCatFeatures(options, n_raw_features, model.feature_names);
 
 	const bool is_ranking = objective == BoostObjective::LAMBDARANK || objective == BoostObjective::PAIRWISE;
 	if (is_ranking) {
@@ -1048,6 +1258,9 @@ BoostModel TrainReference(const vector<double> &y, const vector<vector<double>> 
 			std::sort(valid_rows.begin(), valid_rows.end());
 		}
 	}
+
+	auto x = ExpandFeaturesWithCtr(model, y, x_in, train_rows, weights, cat_set, options);
+	idx_t n_features = model.n_features;
 
 	double best_valid = std::numeric_limits<double>::infinity();
 	idx_t best_rounds = 0;

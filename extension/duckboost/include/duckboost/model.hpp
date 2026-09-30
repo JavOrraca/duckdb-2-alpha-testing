@@ -84,6 +84,12 @@ struct CtrFeatureSpec {
 	vector<int64_t> hash_values_alt; // Borders successes (empty for Counter)
 };
 
+uint64_t FeatureHashU64(double value);
+uint64_t CombineCtrHash(const CtrFeatureSpec &ctr, const vector<double> &features);
+double CtrValueFromCounts(const CtrFeatureSpec &ctr, int64_t count_or_failures, int64_t successes);
+
+enum class CtrTargetLeakage : uint8_t { LEAVE_ONE_OUT = 0, EXPANDING = 1, NONE = 2 };
+
 struct BoostModel {
 	idx_t duckboost_version = 1;
 	BoostBackend backend = BoostBackend::REFERENCE;
@@ -163,6 +169,13 @@ struct TrainOptions {
 	//! "balanced" or comma-separated per-class multipliers; empty = none.
 	string class_weight;
 	vector<string> feature_names;
+	//! Comma-separated CTR types to build on cat_features (e.g. "Borders", "Counter,Borders"). Empty = off.
+	string ctr_types;
+	double ctr_prior_numerator = 0.5;
+	double ctr_prior_denominator = 1.0;
+	double ctr_scale = 1.0;
+	double ctr_shift = 0.0;
+	CtrTargetLeakage ctr_target_leakage = CtrTargetLeakage::LEAVE_ONE_OUT;
 
 	static TrainOptions FromMap(const unordered_map<string, string> &options);
 };

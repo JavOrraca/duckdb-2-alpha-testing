@@ -5,6 +5,7 @@
 #include "duckdb/common/numeric_utils.hpp"
 #include "duckdb/common/string_util.hpp"
 
+#include <algorithm>
 #include <cctype>
 #include <cmath>
 #include <cstdint>
@@ -674,6 +675,171 @@ SqlExportOptions SqlExportOptions::FromMap(const unordered_map<string, string> &
 	return result;
 }
 
+static bool ParseBoolOption(const string &value, const char *name) {
+	auto lower = StringUtil::Lower(value);
+	if (lower == "true" || lower == "1" || lower == "yes") {
+		return true;
+	}
+	if (lower == "false" || lower == "0" || lower == "no") {
+		return false;
+	}
+	throw InvalidInputException("duckboost: %s must be true/false", name);
+}
+
+ImportanceOptions ImportanceOptions::FromMap(const unordered_map<string, string> &options) {
+	ImportanceOptions result;
+	for (auto &entry : options) {
+		auto key = StringUtil::Lower(entry.first);
+		auto value = StringUtil::Lower(entry.second);
+		if (key == "metric") {
+			if (value != "gain" && value != "cover" && value != "frequency" && value != "weight" && value != "count") {
+				throw InvalidInputException("duckboost: importance metric must be gain, cover, or frequency (got '%s')",
+				                            entry.second);
+			}
+			if (value == "weight" || value == "count") {
+				value = "frequency";
+			}
+			result.metric = value;
+		} else if (key == "normalize") {
+			result.normalize = ParseBoolOption(entry.second, "normalize");
+		} else if (key == "include_unused" || key == "include_zero" || key == "all_features") {
+			result.include_unused = ParseBoolOption(entry.second, "include_unused");
+		} else if (key == "sort" || key == "order_by") {
+			if (value != "importance" && value != "gain" && value != "cover" && value != "frequency" &&
+			    value != "weight" && value != "count" && value != "name" && value != "variable" && value != "index") {
+				throw InvalidInputException(
+				    "duckboost: importance sort must be importance, gain, cover, frequency, name, or index");
+			}
+			if (value == "weight" || value == "count") {
+				value = "frequency";
+			}
+			if (value == "variable") {
+				value = "name";
+			}
+			result.sort = value;
+		} else {
+			throw InvalidInputException("duckboost: unknown importance option '%s'", entry.first);
+		}
+	}
+	return result;
+}
+
+static string FeatureNameAt(const BoostModel &model, idx_t feature_idx) {
+	if (feature_idx < model.feature_names.size() && !model.feature_names[feature_idx].empty()) {
+		return model.feature_names[feature_idx];
+	}
+	for (auto &ctr : model.ctr_features) {
+		if (ctr.feature_index == feature_idx) {
+			return "_duckboost_ctr_" + std::to_string(feature_idx);
+		}
+	}
+	return "f" + std::to_string(feature_idx);
+}
+
+vector<FeatureImportance> ComputeFeatureImportance(const BoostModel &model, const ImportanceOptions &options) {
+	const idx_t n_features = model.n_features > 0 ? model.n_features : model.feature_names.size();
+	vector<FeatureImportance> rows(n_features);
+	for (idx_t i = 0; i < n_features; i++) {
+		rows[i].feature_index = i;
+		rows[i].variable = FeatureNameAt(model, i);
+	}
+	idx_t max_seen = n_features;
+	for (auto &tree : model.trees) {
+		for (auto &node : tree.nodes) {
+			if (node.is_leaf) {
+				continue;
+			}
+			if (node.feature >= max_seen) {
+				rows.resize(node.feature + 1);
+				for (idx_t i = max_seen; i <= node.feature; i++) {
+					rows[i].feature_index = i;
+					rows[i].variable = FeatureNameAt(model, i);
+				}
+				max_seen = node.feature + 1;
+			}
+			rows[node.feature].gain += std::max(0.0, node.gain);
+			rows[node.feature].cover += std::max(0.0, node.cover);
+			rows[node.feature].frequency += 1;
+		}
+	}
+
+	if (!options.include_unused) {
+		vector<FeatureImportance> used;
+		used.reserve(rows.size());
+		for (auto &row : rows) {
+			if (row.frequency > 0 || row.gain > 0 || row.cover > 0) {
+				used.push_back(row);
+			}
+		}
+		rows = std::move(used);
+	}
+
+	double total_gain = 0;
+	double total_cover = 0;
+	double total_frequency = 0;
+	for (auto &row : rows) {
+		total_gain += row.gain;
+		total_cover += row.cover;
+		total_frequency += static_cast<double>(row.frequency);
+	}
+	// Imports without persisted split stats fall back to frequency for metric=gain.
+	string effective_metric = options.metric;
+	if (effective_metric == "gain" && total_gain <= 0) {
+		effective_metric = "frequency";
+	}
+
+	auto metric_value = [&](const FeatureImportance &row) -> double {
+		if (effective_metric == "cover") {
+			return row.cover;
+		}
+		if (effective_metric == "frequency") {
+			return static_cast<double>(row.frequency);
+		}
+		return row.gain;
+	};
+	double total = 0;
+	if (effective_metric == "cover") {
+		total = total_cover;
+	} else if (effective_metric == "frequency") {
+		total = total_frequency;
+	} else {
+		total = total_gain;
+	}
+	for (auto &row : rows) {
+		auto value = metric_value(row);
+		row.importance = options.normalize ? (total > 0 ? value / total : 0) : value;
+	}
+
+	std::sort(rows.begin(), rows.end(), [&](const FeatureImportance &a, const FeatureImportance &b) {
+		int order = 0;
+		if (options.sort == "gain") {
+			order = (a.gain > b.gain) - (a.gain < b.gain);
+		} else if (options.sort == "cover") {
+			order = (a.cover > b.cover) - (a.cover < b.cover);
+		} else if (options.sort == "frequency") {
+			order = (a.frequency > b.frequency) - (a.frequency < b.frequency);
+		} else if (options.sort == "name") {
+			if (a.variable < b.variable) {
+				order = 1;
+			} else if (a.variable > b.variable) {
+				order = -1;
+			}
+		} else if (options.sort == "index") {
+			order = (a.feature_index < b.feature_index) - (a.feature_index > b.feature_index);
+		} else {
+			order = (a.importance > b.importance) - (a.importance < b.importance);
+		}
+		if (order != 0) {
+			return order > 0;
+		}
+		if (a.feature_index != b.feature_index) {
+			return a.feature_index < b.feature_index;
+		}
+		return a.variable < b.variable;
+	});
+	return rows;
+}
+
 string BoostModel::ToJSON() const {
 	std::ostringstream out;
 	out << "{\"duckboost_version\":" << duckboost_version;
@@ -735,6 +901,12 @@ string BoostModel::ToJSON() const {
 			}
 			if (!node.is_leaf) {
 				out << ",\"default_left\":" << (node.default_left ? "true" : "false");
+				if (node.gain != 0) {
+					out << ",\"gain\":" << FormatDouble(node.gain);
+				}
+				if (node.cover != 0) {
+					out << ",\"cover\":" << FormatDouble(node.cover);
+				}
 			}
 			out << '}';
 		}
@@ -915,6 +1087,10 @@ BoostModel BoostModel::FromJSON(const string &json) {
 								                                                              : SplitCompare::LESS;
 							} else if (node_key == "default_left" || node_key == "missing_left") {
 								node.default_left = p.ParseBool();
+							} else if (node_key == "gain") {
+								node.gain = p.ParseNumber();
+							} else if (node_key == "cover") {
+								node.cover = p.ParseNumber();
 							} else {
 								p.SkipValue();
 							}

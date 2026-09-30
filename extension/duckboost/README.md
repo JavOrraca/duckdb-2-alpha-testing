@@ -111,7 +111,32 @@ SELECT * FROM duckboost_score((SELECT model FROM models), 'test', [x1, x2]);
 
 -- Multiclass: predict returns argmax class index; predict_proba returns softmax LIST
 SELECT duckboost_predict(model, features), duckboost_predict_proba(model, features);
+
+-- Feature importance (tidy / vip-style ranking from split stats)
+SELECT * FROM duckboost_importance(model);
+SELECT * FROM duckboost_importance(model, MAP {'metric': 'cover', 'normalize': 'true'});
+-- Drop near-zero contributors after a glance (recipes step_rm vibe, without a prep engine):
+SELECT variable FROM duckboost_importance(model) WHERE importance >= 0.01;
 ```
+
+### Feature importance
+
+`duckboost_importance(model [, options])` returns one row per predictor:
+
+| Column | Meaning |
+| --- | --- |
+| `variable` | Feature name (`feature_names`, else `fN`, CTR slots `_duckboost_ctr_N`) |
+| `feature_index` | Flat feature index used in trees |
+| `gain` | Total loss reduction from splits on this feature |
+| `cover` | Total parent hessian mass covered by those splits |
+| `frequency` | Split count (`weight` / `count` aliases accepted in options) |
+| `importance` | Normalized primary metric (sums to 1 by default) |
+
+Options: `metric` (`gain` default, or `cover` / `frequency`), `normalize` (default `true`), `include_unused` (default `true`), `sort` (`importance` / `gain` / `cover` / `frequency` / `name` / `index`).
+
+This is intentionally small — named columns and a tidy table you can `ORDER BY` / filter in SQL — not a tidymodels/recipes meta-engine. Use it to triage predictors after training; keep heavy prep (encoding recipes, novel levels, etc.) outside or in ordinary SQL.
+
+Reference-trained models persist per-split `gain` / `cover` in JSON. Imported vendor dumps without those fields still report `frequency`; `metric=gain` then falls back to frequency for the `importance` column.
 
 ### Backends
 
@@ -209,6 +234,8 @@ For `task: "multiclass"`, `n_classes >= 2`, optional `base_scores` holds per-cla
   sample/class weights, L1/L2/`gamma`, row/column subsample, and optional early stopping. Linked
   XGBoost/LightGBM bridges forward objectives (including ranking groups), early stopping, weights,
   categoricals, and leaf-wise knobs when available.
+- **Feature importance** exposes gain / cover / frequency from trained trees via `duckboost_importance`
+  (tidy `variable` ranking — recipes/vip ergonomics without a prep pipeline).
 - **Table macros** `duckboost_fit` / `duckboost_score` wrap `duckboost_train` / `duckboost_predict` with `query_table` for a compact SQL workflow.
 
 ## Roadmap
@@ -218,4 +245,5 @@ For `task: "multiclass"`, `n_classes >= 2`, optional `base_scores` holds per-cla
 - [x] Vendor C API bridges for XGBoost / LightGBM (train → dump → import into `BoostModel`)
 - [x] Community publish kit (`community/description.yml`, `scripts/extract_duckboost_oot.sh`, dual-mode CMake)
 - [x] Orphan publish surface `cursor/duckboost-community-oot-0c09` + submit-ready descriptor (`community/SUBMIT.md`)
+- [x] Feature importance (`duckboost_importance`: gain / cover / frequency)
 - [ ] Open PR on `duckdb/community-extensions` with `extensions/duckboost/description.yml` (**hold until official DuckDB 2.0 release**)

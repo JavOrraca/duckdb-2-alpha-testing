@@ -50,6 +50,10 @@ struct TreeNode {
 	SplitCompare compare = SplitCompare::LESS;
 	//! When feature is NaN/missing, take left if true else right (XGBoost-style learned default).
 	bool default_left = true;
+	//! Loss reduction from this split (reference trainer); 0 for imports without stats.
+	double gain = 0;
+	//! Parent hessian mass covered by this split (reference trainer); 0 if unknown.
+	double cover = 0;
 };
 
 struct BoostTree {
@@ -191,6 +195,31 @@ struct SqlExportOptions {
 	string prediction_alias = "prediction";
 	static SqlExportOptions FromMap(const unordered_map<string, string> &options);
 };
+
+//! Options for duckboost_importance (tidy / vip-style feature ranking).
+struct ImportanceOptions {
+	//! Column that feeds the normalized `importance` score: gain | cover | frequency.
+	string metric = "gain";
+	//! Divide `importance` by the column sum so values add to 1 (default true).
+	bool normalize = true;
+	//! Emit unused features with zeros (default true; mirrors recipes keeping all predictors).
+	bool include_unused = true;
+	//! Sort key: importance | gain | cover | frequency | name | index.
+	string sort = "importance";
+	static ImportanceOptions FromMap(const unordered_map<string, string> &options);
+};
+
+struct FeatureImportance {
+	string variable;
+	idx_t feature_index = 0;
+	double gain = 0;
+	double cover = 0;
+	idx_t frequency = 0;
+	double importance = 0;
+};
+
+//! Aggregate split gain / cover / frequency per feature (XGBoost-style triad).
+vector<FeatureImportance> ComputeFeatureImportance(const BoostModel &model, const ImportanceOptions &options = {});
 
 string BackendToString(BoostBackend backend);
 BoostBackend BackendFromString(const string &name);

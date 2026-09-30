@@ -21,6 +21,17 @@ enum class BoostBackend : uint8_t { REFERENCE = 0, XGBOOST = 1, LIGHTGBM = 2, CA
 
 enum class BoostTask : uint8_t { REGRESSION = 0, BINARY = 1, MULTICLASS = 2 };
 
+//! Training / prediction objective. AUTO derives from task (squared / logistic / softmax).
+enum class BoostObjective : uint8_t {
+	AUTO = 0,
+	SQUAREDERROR = 1,
+	LOGISTIC = 2,
+	SOFTMAX = 3,
+	POISSON = 4,
+	HUBER = 5,
+	QUANTILE = 6
+};
+
 //! DEPTH: classic level/depth-wise growth. LEAF: LightGBM-style leaf-wise with max_leaves.
 enum class GrowPolicy : uint8_t { DEPTH = 0, LEAF = 1 };
 
@@ -75,6 +86,7 @@ struct BoostModel {
 	idx_t duckboost_version = 1;
 	BoostBackend backend = BoostBackend::REFERENCE;
 	BoostTask task = BoostTask::REGRESSION;
+	BoostObjective objective = BoostObjective::AUTO;
 	double base_score = 0;
 	//! Per-class biases for multiclass; empty means use base_score for every class.
 	vector<double> base_scores;
@@ -84,6 +96,8 @@ struct BoostModel {
 	idx_t n_raw_features = 0;
 	//! 1 for regression/binary; >= 2 for multiclass.
 	idx_t n_classes = 1;
+	double huber_delta = 1.0;
+	double quantile_alpha = 0.5;
 	vector<string> feature_names;
 	//! For multiclass: trees laid out as [round][class] → index round * n_classes + class.
 	vector<BoostTree> trees;
@@ -92,12 +106,13 @@ struct BoostModel {
 	string ToJSON() const;
 	static BoostModel FromJSON(const string &json);
 
+	BoostObjective ResolvedObjective() const;
 	double ClassBias(idx_t class_idx) const;
 	vector<double> MaterializeFeatures(const vector<double> &features) const;
 	double EvalTree(const BoostTree &tree, const vector<double> &features) const;
 	double PredictRaw(const vector<double> &features) const;
 	vector<double> PredictRawMulti(const vector<double> &features) const;
-	//! Regression/binary probability, or multiclass argmax class index.
+	//! Regression/poisson/huber/quantile mean, binary probability, or multiclass argmax class index.
 	double Predict(const vector<double> &features) const;
 	vector<double> PredictProba(const vector<double> &features) const;
 };
@@ -105,6 +120,9 @@ struct BoostModel {
 struct TrainOptions {
 	BoostBackend backend = BoostBackend::REFERENCE;
 	BoostTask task = BoostTask::REGRESSION;
+	BoostObjective objective = BoostObjective::AUTO;
+	double huber_delta = 1.0;
+	double quantile_alpha = 0.5;
 	idx_t n_estimators = 10;
 	idx_t max_depth = 3;
 	double learning_rate = 0.1;
@@ -158,6 +176,9 @@ string BackendToString(BoostBackend backend);
 BoostBackend BackendFromString(const string &name);
 string TaskToString(BoostTask task);
 BoostTask TaskFromString(const string &name);
+string ObjectiveToString(BoostObjective objective);
+BoostObjective ObjectiveFromString(const string &name);
+BoostObjective ResolveObjective(BoostTask task, BoostObjective objective);
 
 bool BackendTrainingSupported(BoostBackend backend);
 string BackendCapabilityNote(BoostBackend backend);

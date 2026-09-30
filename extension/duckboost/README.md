@@ -129,6 +129,9 @@ Native XGBoost / LightGBM linking is opt-in via `DUCKBOOST_WITH_*`. Linked build
 | Key | Default | Notes |
 | --- | --- | --- |
 | `task` | `regression` | `regression`, `binary`, or `multiclass` |
+| `objective` | `auto` | `auto` (from task), `squarederror`, `logistic`, `softmax`, `poisson`, `huber`, `quantile`. Legacy: `objective: binary` still sets `task`. |
+| `huber_delta` | `1` | Huber threshold (`delta`); not L1 `alpha` |
+| `quantile_alpha` | `0.5` | Pinball quantile in `(0, 1)` |
 | `n_estimators` | `10` | Boosting rounds |
 | `max_depth` | `3` | Depth-wise trees |
 | `learning_rate` | `0.1` | Shrinkage (`eta` / `lr`) |
@@ -140,7 +143,7 @@ Native XGBoost / LightGBM linking is opt-in via `DUCKBOOST_WITH_*`. Linked build
 | `reg_lambda` / `reg_alpha` | `1` / `0` | L2 / L1 on leaf weights |
 | `gamma` | `0` | Min split gain |
 | `subsample` / `colsample_bytree` | `1` / `1` | Row / column bagging per tree |
-| `early_stopping_rounds` | `0` | With `validation_fraction` (default `0.2` when early stopping set) |
+| `early_stopping_rounds` | `0` | With `validation_fraction` (default `0.2` when early stopping set); also honored by linked XGBoost/LightGBM bridges |
 | `seed` | `0` | RNG seed for sampling / valid split |
 | `n_classes` | inferred | Multiclass class count override |
 | `cat_features` | _(none)_ | Comma-separated indices or `feature_names` for EQUAL splits |
@@ -148,7 +151,7 @@ Native XGBoost / LightGBM linking is opt-in via `DUCKBOOST_WITH_*`. Linked build
 
 Optional sample weights: `duckboost_train(y, features, weight [, options])`.
 
-SQL `NULL` and IEEE NaN in feature lists are treated as missing. The reference trainer learns a per-split default direction (serialized as `default_left`), matching XGBoost’s missing-child behavior. Target `y` must still be non-NULL. Multiclass uses softmax (`task: multiclass`); categorical columns use `compare: equal` splits.
+SQL `NULL` and IEEE NaN in feature lists are treated as missing. The reference trainer learns a per-split default direction (serialized as `default_left`), matching XGBoost’s missing-child behavior. Target `y` must still be non-NULL. Multiclass uses softmax (`task: multiclass`); categorical columns use `compare: equal` splits. Poisson predictions / SQL export apply `exp(raw)`; Huber and quantile keep the raw score as the mean/quantile estimate.
 
 ### Dump import notes
 
@@ -183,10 +186,11 @@ For `task: "multiclass"`, `n_classes >= 2`, optional `base_scores` holds per-cla
 
 - **Intended home**: out-of-tree community extension (heavy optional deps + ML surface area). Prototyped in-tree here for DuckDB 2.0 development.
 - **SQL export** mirrors orbital's `separate_trees` idea so DuckDB can evaluate ensemble members as independent columns.
-- **Reference trainer** is a second-order histogram GBDT (squared error, logistic, softmax) with
-  XGBoost-style missing-value defaults, categorical EQUAL splits, depth- or leaf-wise growth,
-  sample/class weights, L1/L2/`gamma`, row/column subsample, and optional early stopping. Linked
-  XGBoost/LightGBM bridges forward weights, categoricals, and leaf-wise knobs when available.
+- **Reference trainer** is a second-order histogram GBDT (squared error, logistic, softmax, poisson,
+  huber, quantile) with XGBoost-style missing-value defaults, categorical EQUAL splits, depth- or
+  leaf-wise growth, sample/class weights, L1/L2/`gamma`, row/column subsample, and optional early
+  stopping. Linked XGBoost/LightGBM bridges forward objectives, early stopping, weights, categoricals,
+  and leaf-wise knobs when available.
 - **Table macros** `duckboost_fit` / `duckboost_score` wrap `duckboost_train` / `duckboost_predict` with `query_table` for a compact SQL workflow.
 
 ## Roadmap

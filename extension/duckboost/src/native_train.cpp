@@ -10,6 +10,7 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <numeric>
 #include <string>
 #include <vector>
 
@@ -27,6 +28,8 @@ int XGBoosterCreate(const DMatrixHandle dmats[], bst_ulong len, BoosterHandle *o
 int XGBoosterFree(BoosterHandle handle);
 int XGBoosterSetParam(BoosterHandle handle, const char *name, const char *value);
 int XGBoosterUpdateOneIter(BoosterHandle handle, int iter, DMatrixHandle dtrain);
+int XGBoosterPredict(BoosterHandle handle, DMatrixHandle dmat, int option_mask, unsigned ntree_limit, int training,
+                     bst_ulong *out_len, const float **out_result);
 int XGBoosterDumpModelEx(BoosterHandle handle, const char *fmap, int with_stats, const char *format, bst_ulong *out_len,
                          const char ***out_dump_array);
 int XGBoosterDumpModelExWithFeatures(BoosterHandle handle, int fnum, const char **fname, const char **ftype,
@@ -47,7 +50,9 @@ int LGBM_DatasetSetField(DatasetHandle handle, const char *field_name, const voi
 int LGBM_DatasetSetFeatureNames(DatasetHandle handle, const char **feature_names, int num_feature_names);
 int LGBM_DatasetFree(DatasetHandle handle);
 int LGBM_BoosterCreate(const DatasetHandle train_data, const char *parameters, BoosterHandle *out);
+int LGBM_BoosterAddValidData(BoosterHandle handle, const DatasetHandle valid_data);
 int LGBM_BoosterUpdateOneIter(BoosterHandle handle, int *is_finished);
+int LGBM_BoosterGetEval(BoosterHandle handle, int data_idx, int *out_len, double *out_results);
 int LGBM_BoosterSaveModelToString(BoosterHandle handle, int start_iteration, int num_iteration,
                                   int feature_importance_type, int64_t buffer_len, int64_t *out_len, char *out_str);
 int LGBM_BoosterFree(BoosterHandle handle);
@@ -91,34 +96,129 @@ ImportOptions ImportOptionsFromTrain(const TrainOptions &options) {
 	return import_options;
 }
 
-string ObjectiveForXGBoost(BoostTask task, idx_t n_classes) {
-	switch (task) {
-	case BoostTask::BINARY:
+string ObjectiveForXGBoost(BoostTask task, BoostObjective objective, idx_t n_classes) {
+	auto resolved = ResolveObjective(task, objective);
+	switch (resolved) {
+	case BoostObjective::LOGISTIC:
 		return "binary:logistic";
-	case BoostTask::MULTICLASS:
+	case BoostObjective::SOFTMAX:
 		if (n_classes < 2) {
 			throw InvalidInputException("duckboost: xgboost multiclass train requires n_classes >= 2");
 		}
 		return "multi:softprob";
-	case BoostTask::REGRESSION:
+	case BoostObjective::POISSON:
+		return "count:poisson";
+	case BoostObjective::HUBER:
+		return "reg:pseudohubererror";
+	case BoostObjective::QUANTILE:
+		return "reg:quantileerror";
+	case BoostObjective::SQUAREDERROR:
+	case BoostObjective::AUTO:
 	default:
 		return "reg:squarederror";
 	}
 }
 
-string ObjectiveForLightGBM(BoostTask task, idx_t n_classes) {
-	switch (task) {
-	case BoostTask::BINARY:
+string ObjectiveForLightGBM(BoostTask task, BoostObjective objective, idx_t n_classes) {
+	auto resolved = ResolveObjective(task, objective);
+	switch (resolved) {
+	case BoostObjective::LOGISTIC:
 		return "binary";
-	case BoostTask::MULTICLASS:
+	case BoostObjective::SOFTMAX:
 		if (n_classes < 2) {
 			throw InvalidInputException("duckboost: lightgbm multiclass train requires n_classes >= 2");
 		}
 		return "multiclass";
-	case BoostTask::REGRESSION:
+	case BoostObjective::POISSON:
+		return "poisson";
+	case BoostObjective::HUBER:
+		return "huber";
+	case BoostObjective::QUANTILE:
+		return "quantile";
+	case BoostObjective::SQUAREDERROR:
+	case BoostObjective::AUTO:
 	default:
 		return "regression";
 	}
+}
+
+string EvalMetricForObjective(BoostObjective objective) {
+	switch (objective) {
+	case BoostObjective::LOGISTIC:
+		return "logloss";
+	case BoostObjective::SOFTMAX:
+		return "mlogloss";
+	case BoostObjective::QUANTILE:
+		return "mae";
+	case BoostObjective::POISSON:
+	case BoostObjective::HUBER:
+	case BoostObjective::SQUAREDERROR:
+	case BoostObjective::AUTO:
+	default:
+		return "rmse";
+	}
+}
+
+struct RowSplit {
+	vector<idx_t> train_rows;
+	vector<idx_t> valid_rows;
+};
+
+RowSplit MakeValidationSplit(idx_t n_rows, const TrainOptions &options) {
+	RowSplit split;
+	split.train_rows.resize(n_rows);
+	std::iota(split.train_rows.begin(), split.train_rows.end(), 0);
+	if (!(options.validation_fraction > 0 && options.early_stopping_rounds > 0 && n_rows >= 4)) {
+		return split;
+	}
+	uint64_t state = options.seed ? options.seed : 0x9e3779b97f4a7c15ULL;
+	auto next = [&]() {
+		state ^= state << 13;
+		state ^= state >> 7;
+		state ^= state << 17;
+		return state;
+	};
+	auto shuffled = split.train_rows;
+	for (idx_t i = 0; i < shuffled.size(); i++) {
+		idx_t j = i + static_cast<idx_t>(next() % (shuffled.size() - i));
+		std::swap(shuffled[i], shuffled[j]);
+	}
+	idx_t valid_n =
+	    MaxValue<idx_t>(1, static_cast<idx_t>(std::floor(options.validation_fraction * static_cast<double>(n_rows))));
+	valid_n = MinValue<idx_t>(valid_n, n_rows - 1);
+	split.valid_rows.assign(shuffled.begin(), shuffled.begin() + valid_n);
+	split.train_rows.assign(shuffled.begin() + valid_n, shuffled.end());
+	std::sort(split.train_rows.begin(), split.train_rows.end());
+	std::sort(split.valid_rows.begin(), split.valid_rows.end());
+	return split;
+}
+
+void MaterializeRowSubset(const vector<vector<double>> &x, const vector<double> &y, const vector<float> &weights,
+                          const vector<idx_t> &rows, idx_t ncol, vector<float> &flat, vector<float> &labels,
+                          vector<float> &weight_out) {
+	flat.resize(rows.size() * ncol);
+	labels.resize(rows.size());
+	weight_out.resize(rows.size());
+	for (idx_t i = 0; i < rows.size(); i++) {
+		auto row = rows[i];
+		labels[i] = static_cast<float>(y[row]);
+		weight_out[i] = weights[row];
+		for (idx_t j = 0; j < ncol; j++) {
+			flat[i * ncol + j] = static_cast<float>(x[row][j]);
+		}
+	}
+}
+
+double RMSEFromPreds(const float *preds, const vector<float> &labels) {
+	if (labels.empty()) {
+		return std::numeric_limits<double>::infinity();
+	}
+	double sse = 0;
+	for (idx_t i = 0; i < labels.size(); i++) {
+		double err = static_cast<double>(preds[i]) - static_cast<double>(labels[i]);
+		sse += err * err;
+	}
+	return std::sqrt(sse / static_cast<double>(labels.size()));
 }
 
 idx_t InferClassCount(const vector<double> &y, const TrainOptions &options) {
@@ -242,87 +342,10 @@ vector<float> ResolveNativeWeights(const vector<double> &y, const TrainOptions &
 	throw InvalidInputException("duckboost: xgboost %s failed: %s", context, err ? err : "unknown error");
 }
 
-BoostModel TrainWithXGBoost(const vector<double> &y, const vector<vector<double>> &x, const TrainOptions &options,
-                            const vector<double> &weights) {
-	EnsureRectangular(y, x);
-	const idx_t nrow = y.size();
-	const idx_t ncol = x[0].size();
-	const idx_t n_classes = InferClassCount(y, options);
-	const idx_t weight_classes = options.task == BoostTask::BINARY ? 2 : n_classes;
-	auto cat_indices = ResolveNativeCatFeatures(options, ncol);
-	auto weight_f = ResolveNativeWeights(y, options, weights, weight_classes);
-
-	vector<float> flat(nrow * ncol);
-	vector<float> labels(nrow);
-	for (idx_t i = 0; i < nrow; i++) {
-		labels[i] = static_cast<float>(y[i]);
-		for (idx_t j = 0; j < ncol; j++) {
-			flat[i * ncol + j] = static_cast<float>(x[i][j]);
-		}
-	}
-
-	DMatrixHandle dmat = nullptr;
-	if (XGDMatrixCreateFromMat(flat.data(), static_cast<bst_ulong>(nrow), static_cast<bst_ulong>(ncol),
-	                           std::numeric_limits<float>::quiet_NaN(), &dmat) != 0) {
-		ThrowXGBoostError("XGDMatrixCreateFromMat");
-	}
-	if (XGDMatrixSetFloatInfo(dmat, "label", labels.data(), static_cast<bst_ulong>(nrow)) != 0) {
-		XGDMatrixFree(dmat);
-		ThrowXGBoostError("XGDMatrixSetFloatInfo(label)");
-	}
-	if (XGDMatrixSetFloatInfo(dmat, "weight", weight_f.data(), static_cast<bst_ulong>(nrow)) != 0) {
-		XGDMatrixFree(dmat);
-		ThrowXGBoostError("XGDMatrixSetFloatInfo(weight)");
-	}
-
-	BoosterHandle booster = nullptr;
-	const DMatrixHandle dmats[] = {dmat};
-	if (XGBoosterCreate(dmats, 1, &booster) != 0) {
-		XGDMatrixFree(dmat);
-		ThrowXGBoostError("XGBoosterCreate");
-	}
-
-	auto set_param = [&](const char *name, const string &value) {
-		if (XGBoosterSetParam(booster, name, value.c_str()) != 0) {
-			XGBoosterFree(booster);
-			XGDMatrixFree(dmat);
-			ThrowXGBoostError((string("XGBoosterSetParam(") + name + ")").c_str());
-		}
-	};
-
-	set_param("verbosity", "0");
-	set_param("max_depth", std::to_string(options.max_depth));
-	set_param("max_bin", std::to_string(MaxValue<idx_t>(options.max_bins, 2)));
-	set_param("eta", std::to_string(options.learning_rate));
-	set_param("min_child_weight", std::to_string(options.min_child_weight));
-	set_param("lambda", std::to_string(options.reg_lambda));
-	set_param("alpha", std::to_string(options.reg_alpha));
-	set_param("gamma", std::to_string(options.min_split_gain));
-	set_param("subsample", std::to_string(options.subsample));
-	set_param("colsample_bytree", std::to_string(options.colsample_bytree));
-	set_param("seed", std::to_string(options.seed));
-	set_param("objective", ObjectiveForXGBoost(options.task, n_classes));
-	if (options.grow_policy == GrowPolicy::LEAF) {
-		set_param("grow_policy", "lossguide");
-		set_param("max_leaves", std::to_string(EffectiveMaxLeavesNative(options)));
-	} else {
-		set_param("grow_policy", "depthwise");
-	}
-	if (options.task == BoostTask::MULTICLASS) {
-		set_param("num_class", std::to_string(n_classes));
-	}
-
-	for (idx_t iter = 0; iter < options.n_estimators; iter++) {
-		if (XGBoosterUpdateOneIter(booster, static_cast<int>(iter), dmat) != 0) {
-			XGBoosterFree(booster);
-			XGDMatrixFree(dmat);
-			ThrowXGBoostError("XGBoosterUpdateOneIter");
-		}
-	}
-
+string DumpXGBoostJSON(BoosterHandle booster, idx_t ncol, const vector<idx_t> &cat_indices,
+                       const TrainOptions &options) {
 	bst_ulong out_len = 0;
 	const char **out_dump = nullptr;
-	int dump_rc = 0;
 	vector<string> dummy_names;
 	vector<const char *> fnames(ncol);
 	vector<const char *> ftypes(ncol, "q");
@@ -340,17 +363,14 @@ BoostModel TrainWithXGBoost(const vector<double> &y, const vector<vector<double>
 			fnames[i] = dummy_names[i].c_str();
 		}
 	}
-	dump_rc = XGBoosterDumpModelExWithFeatures(booster, static_cast<int>(ncol), fnames.data(), ftypes.data(), 0, "json",
-	                                           &out_len, &out_dump);
+	int dump_rc = XGBoosterDumpModelExWithFeatures(booster, static_cast<int>(ncol), fnames.data(), ftypes.data(), 0,
+	                                               "json", &out_len, &out_dump);
 	if (dump_rc != 0 || !out_dump) {
 		dump_rc = XGBoosterDumpModelEx(booster, "", 0, "json", &out_len, &out_dump);
 	}
 	if (dump_rc != 0 || !out_dump) {
-		XGBoosterFree(booster);
-		XGDMatrixFree(dmat);
-		ThrowXGBoostError("XGBoosterDumpModelEx");
+		return string();
 	}
-
 	string dump = "[";
 	for (bst_ulong i = 0; i < out_len; i++) {
 		if (i > 0) {
@@ -359,9 +379,174 @@ BoostModel TrainWithXGBoost(const vector<double> &y, const vector<vector<double>
 		dump += out_dump[i] ? out_dump[i] : "{}";
 	}
 	dump += "]";
+	return dump;
+}
 
-	XGBoosterFree(booster);
-	XGDMatrixFree(dmat);
+BoostModel TrainWithXGBoost(const vector<double> &y, const vector<vector<double>> &x, const TrainOptions &options,
+                            const vector<double> &weights) {
+	EnsureRectangular(y, x);
+	const idx_t nrow = y.size();
+	const idx_t ncol = x[0].size();
+	const idx_t n_classes = InferClassCount(y, options);
+	const auto objective = ResolveObjective(options.task, options.objective);
+	const idx_t weight_classes = options.task == BoostTask::BINARY ? 2 : n_classes;
+	auto cat_indices = ResolveNativeCatFeatures(options, ncol);
+	auto weight_f = ResolveNativeWeights(y, options, weights, weight_classes);
+	auto split = MakeValidationSplit(nrow, options);
+
+	vector<float> train_flat, train_labels, train_weights;
+	MaterializeRowSubset(x, y, weight_f, split.train_rows, ncol, train_flat, train_labels, train_weights);
+
+	DMatrixHandle dtrain = nullptr;
+	if (XGDMatrixCreateFromMat(train_flat.data(), static_cast<bst_ulong>(split.train_rows.size()),
+	                           static_cast<bst_ulong>(ncol), std::numeric_limits<float>::quiet_NaN(), &dtrain) != 0) {
+		ThrowXGBoostError("XGDMatrixCreateFromMat(train)");
+	}
+	if (XGDMatrixSetFloatInfo(dtrain, "label", train_labels.data(), static_cast<bst_ulong>(train_labels.size())) != 0) {
+		XGDMatrixFree(dtrain);
+		ThrowXGBoostError("XGDMatrixSetFloatInfo(label)");
+	}
+	if (XGDMatrixSetFloatInfo(dtrain, "weight", train_weights.data(), static_cast<bst_ulong>(train_weights.size())) !=
+	    0) {
+		XGDMatrixFree(dtrain);
+		ThrowXGBoostError("XGDMatrixSetFloatInfo(weight)");
+	}
+
+	DMatrixHandle dvalid = nullptr;
+	vector<float> valid_flat, valid_labels, valid_weights;
+	if (!split.valid_rows.empty()) {
+		MaterializeRowSubset(x, y, weight_f, split.valid_rows, ncol, valid_flat, valid_labels, valid_weights);
+		if (XGDMatrixCreateFromMat(valid_flat.data(), static_cast<bst_ulong>(split.valid_rows.size()),
+		                           static_cast<bst_ulong>(ncol), std::numeric_limits<float>::quiet_NaN(),
+		                           &dvalid) != 0) {
+			XGDMatrixFree(dtrain);
+			ThrowXGBoostError("XGDMatrixCreateFromMat(valid)");
+		}
+		if (XGDMatrixSetFloatInfo(dvalid, "label", valid_labels.data(), static_cast<bst_ulong>(valid_labels.size())) !=
+		    0) {
+			XGDMatrixFree(dvalid);
+			XGDMatrixFree(dtrain);
+			ThrowXGBoostError("XGDMatrixSetFloatInfo(valid label)");
+		}
+	}
+
+	BoosterHandle booster = nullptr;
+	const DMatrixHandle dmats[] = {dtrain};
+	if (XGBoosterCreate(dmats, 1, &booster) != 0) {
+		if (dvalid) {
+			XGDMatrixFree(dvalid);
+		}
+		XGDMatrixFree(dtrain);
+		ThrowXGBoostError("XGBoosterCreate");
+	}
+
+	auto cleanup = [&]() {
+		XGBoosterFree(booster);
+		if (dvalid) {
+			XGDMatrixFree(dvalid);
+		}
+		XGDMatrixFree(dtrain);
+	};
+
+	auto set_param = [&](const char *name, const string &value) {
+		if (XGBoosterSetParam(booster, name, value.c_str()) != 0) {
+			cleanup();
+			ThrowXGBoostError((string("XGBoosterSetParam(") + name + ")").c_str());
+		}
+	};
+
+	set_param("verbosity", "0");
+	set_param("max_depth", std::to_string(options.max_depth));
+	set_param("max_bin", std::to_string(MaxValue<idx_t>(options.max_bins, 2)));
+	set_param("eta", std::to_string(options.learning_rate));
+	set_param("min_child_weight", std::to_string(options.min_child_weight));
+	set_param("lambda", std::to_string(options.reg_lambda));
+	set_param("alpha", std::to_string(options.reg_alpha));
+	set_param("gamma", std::to_string(options.min_split_gain));
+	set_param("subsample", std::to_string(options.subsample));
+	set_param("colsample_bytree", std::to_string(options.colsample_bytree));
+	set_param("seed", std::to_string(options.seed));
+	set_param("objective", ObjectiveForXGBoost(options.task, options.objective, n_classes));
+	set_param("eval_metric", EvalMetricForObjective(objective));
+	if (objective == BoostObjective::HUBER) {
+		set_param("huber_slope", std::to_string(options.huber_delta));
+	}
+	if (objective == BoostObjective::QUANTILE) {
+		set_param("quantile_alpha", std::to_string(options.quantile_alpha));
+	}
+	if (options.grow_policy == GrowPolicy::LEAF) {
+		set_param("grow_policy", "lossguide");
+		set_param("max_leaves", std::to_string(EffectiveMaxLeavesNative(options)));
+	} else {
+		set_param("grow_policy", "depthwise");
+	}
+	if (options.task == BoostTask::MULTICLASS) {
+		set_param("num_class", std::to_string(n_classes));
+	}
+
+	string best_dump;
+	double best_metric = std::numeric_limits<double>::infinity();
+	idx_t rounds_since_improve = 0;
+
+	for (idx_t iter = 0; iter < options.n_estimators; iter++) {
+		if (XGBoosterUpdateOneIter(booster, static_cast<int>(iter), dtrain) != 0) {
+			cleanup();
+			ThrowXGBoostError("XGBoosterUpdateOneIter");
+		}
+		if (!dvalid) {
+			continue;
+		}
+		bst_ulong pred_len = 0;
+		const float *preds = nullptr;
+		if (XGBoosterPredict(booster, dvalid, 0, 0, 0, &pred_len, &preds) != 0 || !preds) {
+			cleanup();
+			ThrowXGBoostError("XGBoosterPredict(valid)");
+		}
+		// Multiclass softprob expands to n_classes scores/row; use first-score RMSE proxy only for regression-like.
+		double metric = std::numeric_limits<double>::infinity();
+		if (options.task == BoostTask::MULTICLASS && pred_len == valid_labels.size() * n_classes) {
+			idx_t correct = 0;
+			for (idx_t i = 0; i < valid_labels.size(); i++) {
+				idx_t best = 0;
+				for (idx_t c = 1; c < n_classes; c++) {
+					if (preds[i * n_classes + c] > preds[i * n_classes + best]) {
+						best = c;
+					}
+				}
+				if (static_cast<float>(best) == valid_labels[i]) {
+					correct++;
+				}
+			}
+			metric = 1.0 - static_cast<double>(correct) / static_cast<double>(valid_labels.size());
+		} else if (pred_len >= valid_labels.size()) {
+			metric = RMSEFromPreds(preds, valid_labels);
+		}
+		if (metric < best_metric - 1e-12) {
+			best_metric = metric;
+			rounds_since_improve = 0;
+			best_dump = DumpXGBoostJSON(booster, ncol, cat_indices, options);
+			if (best_dump.empty()) {
+				cleanup();
+				ThrowXGBoostError("XGBoosterDumpModelEx");
+			}
+		} else {
+			rounds_since_improve++;
+			if (rounds_since_improve >= options.early_stopping_rounds) {
+				break;
+			}
+		}
+	}
+
+	string dump = best_dump;
+	if (dump.empty()) {
+		dump = DumpXGBoostJSON(booster, ncol, cat_indices, options);
+		if (dump.empty()) {
+			cleanup();
+			ThrowXGBoostError("XGBoosterDumpModelEx");
+		}
+	}
+
+	cleanup();
 
 	auto import_options = ImportOptionsFromTrain(options);
 	if (options.task == BoostTask::MULTICLASS) {
@@ -380,25 +565,49 @@ BoostModel TrainWithXGBoost(const vector<double> &y, const vector<vector<double>
 	throw InvalidInputException("duckboost: lightgbm %s failed: %s", context, err ? err : "unknown error");
 }
 
+void MaterializeRowSubsetDouble(const vector<vector<double>> &x, const vector<double> &y, const vector<float> &weights,
+                                const vector<idx_t> &rows, idx_t ncol, vector<double> &flat, vector<float> &labels,
+                                vector<float> &weight_out) {
+	flat.resize(rows.size() * ncol);
+	labels.resize(rows.size());
+	weight_out.resize(rows.size());
+	for (idx_t i = 0; i < rows.size(); i++) {
+		auto row = rows[i];
+		labels[i] = static_cast<float>(y[row]);
+		weight_out[i] = weights[row];
+		for (idx_t j = 0; j < ncol; j++) {
+			flat[i * ncol + j] = x[row][j];
+		}
+	}
+}
+
+string SaveLightGBMModel(BoosterHandle booster, int num_iteration) {
+	int64_t out_len = 0;
+	if (LGBM_BoosterSaveModelToString(booster, 0, num_iteration, 0, 0, &out_len, nullptr) != 0) {
+		return string();
+	}
+	vector<char> buffer(static_cast<idx_t>(out_len) + 1);
+	if (LGBM_BoosterSaveModelToString(booster, 0, num_iteration, 0, out_len, &out_len, buffer.data()) != 0) {
+		return string();
+	}
+	return string(buffer.data());
+}
+
 BoostModel TrainWithLightGBM(const vector<double> &y, const vector<vector<double>> &x, const TrainOptions &options,
                              const vector<double> &weights) {
 	EnsureRectangular(y, x);
-	const auto nrow = NumericCast<int32_t>(y.size());
-	const auto ncol = NumericCast<int32_t>(x[0].size());
+	const idx_t nrow = y.size();
+	const idx_t ncol = x[0].size();
 	const idx_t n_classes = InferClassCount(y, options);
+	const auto objective = ResolveObjective(options.task, options.objective);
 	const idx_t weight_classes = options.task == BoostTask::BINARY ? 2 : n_classes;
-	auto cat_indices = ResolveNativeCatFeatures(options, static_cast<idx_t>(ncol));
+	auto cat_indices = ResolveNativeCatFeatures(options, ncol);
 	auto weight_f = ResolveNativeWeights(y, options, weights, weight_classes);
+	auto split = MakeValidationSplit(nrow, options);
 
-	vector<double> flat(static_cast<idx_t>(nrow) * static_cast<idx_t>(ncol));
-	vector<float> labels(static_cast<idx_t>(nrow));
-	for (int32_t i = 0; i < nrow; i++) {
-		labels[static_cast<idx_t>(i)] = static_cast<float>(y[static_cast<idx_t>(i)]);
-		for (int32_t j = 0; j < ncol; j++) {
-			flat[static_cast<idx_t>(i) * static_cast<idx_t>(ncol) + static_cast<idx_t>(j)] =
-			    x[static_cast<idx_t>(i)][static_cast<idx_t>(j)];
-		}
-	}
+	vector<double> train_flat;
+	vector<float> train_labels, train_weights;
+	MaterializeRowSubsetDouble(x, y, weight_f, split.train_rows, ncol, train_flat, train_labels, train_weights);
 
 	string dataset_params = "max_bin=" + std::to_string(MaxValue<idx_t>(options.max_bins, 2));
 	if (!cat_indices.empty()) {
@@ -411,27 +620,48 @@ BoostModel TrainWithLightGBM(const vector<double> &y, const vector<vector<double
 		}
 	}
 
+	auto train_nrow = NumericCast<int32_t>(split.train_rows.size());
+	auto ncol_i = NumericCast<int32_t>(ncol);
+
 	DatasetHandle dataset = nullptr;
-	if (LGBM_DatasetCreateFromMat(flat.data(), C_API_DTYPE_FLOAT64, nrow, ncol, 1, dataset_params.c_str(), nullptr,
-	                              &dataset) != 0) {
+	if (LGBM_DatasetCreateFromMat(train_flat.data(), C_API_DTYPE_FLOAT64, train_nrow, ncol_i, 1, dataset_params.c_str(),
+	                              nullptr, &dataset) != 0) {
 		ThrowLightGBMError("LGBM_DatasetCreateFromMat");
 	}
-	if (LGBM_DatasetSetField(dataset, "label", labels.data(), nrow, C_API_DTYPE_FLOAT32) != 0) {
+	if (LGBM_DatasetSetField(dataset, "label", train_labels.data(), train_nrow, C_API_DTYPE_FLOAT32) != 0) {
 		LGBM_DatasetFree(dataset);
 		ThrowLightGBMError("LGBM_DatasetSetField(label)");
 	}
-	if (LGBM_DatasetSetField(dataset, "weight", weight_f.data(), nrow, C_API_DTYPE_FLOAT32) != 0) {
+	if (LGBM_DatasetSetField(dataset, "weight", train_weights.data(), train_nrow, C_API_DTYPE_FLOAT32) != 0) {
 		LGBM_DatasetFree(dataset);
 		ThrowLightGBMError("LGBM_DatasetSetField(weight)");
 	}
-	if (!options.feature_names.empty() && options.feature_names.size() == static_cast<idx_t>(ncol)) {
-		vector<const char *> fnames(static_cast<idx_t>(ncol));
-		for (int32_t i = 0; i < ncol; i++) {
-			fnames[static_cast<idx_t>(i)] = options.feature_names[static_cast<idx_t>(i)].c_str();
+	if (!options.feature_names.empty() && options.feature_names.size() == ncol) {
+		vector<const char *> fnames(ncol);
+		for (idx_t i = 0; i < ncol; i++) {
+			fnames[i] = options.feature_names[i].c_str();
 		}
-		if (LGBM_DatasetSetFeatureNames(dataset, fnames.data(), ncol) != 0) {
+		if (LGBM_DatasetSetFeatureNames(dataset, fnames.data(), ncol_i) != 0) {
 			LGBM_DatasetFree(dataset);
 			ThrowLightGBMError("LGBM_DatasetSetFeatureNames");
+		}
+	}
+
+	DatasetHandle valid_dataset = nullptr;
+	vector<double> valid_flat;
+	vector<float> valid_labels, valid_weights;
+	if (!split.valid_rows.empty()) {
+		MaterializeRowSubsetDouble(x, y, weight_f, split.valid_rows, ncol, valid_flat, valid_labels, valid_weights);
+		auto valid_nrow = NumericCast<int32_t>(split.valid_rows.size());
+		if (LGBM_DatasetCreateFromMat(valid_flat.data(), C_API_DTYPE_FLOAT64, valid_nrow, ncol_i, 1,
+		                              dataset_params.c_str(), dataset, &valid_dataset) != 0) {
+			LGBM_DatasetFree(dataset);
+			ThrowLightGBMError("LGBM_DatasetCreateFromMat(valid)");
+		}
+		if (LGBM_DatasetSetField(valid_dataset, "label", valid_labels.data(), valid_nrow, C_API_DTYPE_FLOAT32) != 0) {
+			LGBM_DatasetFree(valid_dataset);
+			LGBM_DatasetFree(dataset);
+			ThrowLightGBMError("LGBM_DatasetSetField(valid label)");
 		}
 	}
 
@@ -444,50 +674,87 @@ BoostModel TrainWithLightGBM(const vector<double> &y, const vector<vector<double
 	string params = StringUtil::Format(
 	    "objective=%s learning_rate=%g num_leaves=%llu max_depth=%llu min_data_in_leaf=%llu "
 	    "min_sum_hessian_in_leaf=%g lambda_l2=%g lambda_l1=%g min_gain_to_split=%g "
-	    "bagging_fraction=%g feature_fraction=%g bagging_freq=1 seed=%llu verbosity=-1 force_col_wise=true",
-	    ObjectiveForLightGBM(options.task, n_classes), options.learning_rate, (unsigned long long)num_leaves,
-	    (unsigned long long)options.max_depth, (unsigned long long)MaxValue<idx_t>(options.min_samples_leaf, 1),
-	    options.min_child_weight, options.reg_lambda, options.reg_alpha, options.min_split_gain, options.subsample,
-	    options.colsample_bytree, (unsigned long long)options.seed);
+	    "bagging_fraction=%g feature_fraction=%g bagging_freq=1 seed=%llu verbosity=-1 force_col_wise=true "
+	    "metric=%s",
+	    ObjectiveForLightGBM(options.task, options.objective, n_classes), options.learning_rate,
+	    (unsigned long long)num_leaves, (unsigned long long)options.max_depth,
+	    (unsigned long long)MaxValue<idx_t>(options.min_samples_leaf, 1), options.min_child_weight, options.reg_lambda,
+	    options.reg_alpha, options.min_split_gain, options.subsample, options.colsample_bytree,
+	    (unsigned long long)options.seed, EvalMetricForObjective(objective));
 	if (options.task == BoostTask::MULTICLASS) {
 		params += " num_class=" + std::to_string(n_classes);
+	}
+	if (objective == BoostObjective::HUBER) {
+		params += " alpha=" + std::to_string(options.huber_delta);
+	} else if (objective == BoostObjective::QUANTILE) {
+		params += " alpha=" + std::to_string(options.quantile_alpha);
 	}
 
 	BoosterHandle booster = nullptr;
 	if (LGBM_BoosterCreate(dataset, params.c_str(), &booster) != 0) {
+		if (valid_dataset) {
+			LGBM_DatasetFree(valid_dataset);
+		}
 		LGBM_DatasetFree(dataset);
 		ThrowLightGBMError("LGBM_BoosterCreate");
 	}
+	if (valid_dataset) {
+		if (LGBM_BoosterAddValidData(booster, valid_dataset) != 0) {
+			LGBM_BoosterFree(booster);
+			LGBM_DatasetFree(valid_dataset);
+			LGBM_DatasetFree(dataset);
+			ThrowLightGBMError("LGBM_BoosterAddValidData");
+		}
+	}
+
+	idx_t best_rounds = 0;
+	double best_metric = std::numeric_limits<double>::infinity();
+	idx_t rounds_since_improve = 0;
 
 	for (idx_t iter = 0; iter < options.n_estimators; iter++) {
 		int is_finished = 0;
 		if (LGBM_BoosterUpdateOneIter(booster, &is_finished) != 0) {
 			LGBM_BoosterFree(booster);
+			if (valid_dataset) {
+				LGBM_DatasetFree(valid_dataset);
+			}
 			LGBM_DatasetFree(dataset);
 			ThrowLightGBMError("LGBM_BoosterUpdateOneIter");
+		}
+		if (valid_dataset) {
+			int eval_len = 0;
+			double eval_buf[8];
+			// data_idx 1 = first validation set
+			if (LGBM_BoosterGetEval(booster, 1, &eval_len, eval_buf) == 0 && eval_len > 0) {
+				double metric = eval_buf[0];
+				if (metric < best_metric - 1e-12) {
+					best_metric = metric;
+					best_rounds = iter + 1;
+					rounds_since_improve = 0;
+				} else {
+					rounds_since_improve++;
+					if (rounds_since_improve >= options.early_stopping_rounds) {
+						break;
+					}
+				}
+			}
 		}
 		if (is_finished) {
 			break;
 		}
 	}
 
-	int64_t out_len = 0;
-	if (LGBM_BoosterSaveModelToString(booster, 0, -1, 0, 0, &out_len, nullptr) != 0) {
-		LGBM_BoosterFree(booster);
-		LGBM_DatasetFree(dataset);
-		ThrowLightGBMError("LGBM_BoosterSaveModelToString(size)");
+	int save_iters = best_rounds > 0 ? static_cast<int>(best_rounds) : -1;
+	string dump = SaveLightGBMModel(booster, save_iters);
+	LGBM_BoosterFree(booster);
+	if (valid_dataset) {
+		LGBM_DatasetFree(valid_dataset);
 	}
-	vector<char> buffer(static_cast<idx_t>(out_len) + 1);
-	if (LGBM_BoosterSaveModelToString(booster, 0, -1, 0, out_len, &out_len, buffer.data()) != 0) {
-		LGBM_BoosterFree(booster);
-		LGBM_DatasetFree(dataset);
+	LGBM_DatasetFree(dataset);
+	if (dump.empty()) {
 		ThrowLightGBMError("LGBM_BoosterSaveModelToString");
 	}
 
-	LGBM_BoosterFree(booster);
-	LGBM_DatasetFree(dataset);
-
-	string dump(buffer.data());
 	auto import_options = ImportOptionsFromTrain(options);
 	if (options.task == BoostTask::MULTICLASS) {
 		import_options.n_classes = n_classes;

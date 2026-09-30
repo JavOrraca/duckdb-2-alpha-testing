@@ -187,7 +187,13 @@ BoostModel TrainWithXGBoost(const vector<double> &y, const vector<vector<double>
 	set_param("verbosity", "0");
 	set_param("max_depth", std::to_string(options.max_depth));
 	set_param("eta", std::to_string(options.learning_rate));
-	set_param("min_child_weight", std::to_string(options.min_samples_leaf));
+	set_param("min_child_weight", std::to_string(options.min_child_weight));
+	set_param("lambda", std::to_string(options.reg_lambda));
+	set_param("alpha", std::to_string(options.reg_alpha));
+	set_param("gamma", std::to_string(options.min_split_gain));
+	set_param("subsample", std::to_string(options.subsample));
+	set_param("colsample_bytree", std::to_string(options.colsample_bytree));
+	set_param("seed", std::to_string(options.seed));
 	set_param("objective", ObjectiveForXGBoost(options.task, n_classes));
 	if (options.task == BoostTask::MULTICLASS) {
 		set_param("num_class", std::to_string(n_classes));
@@ -290,10 +296,13 @@ BoostModel TrainWithLightGBM(const vector<double> &y, const vector<vector<double
 
 	string params = StringUtil::Format(
 	    "objective=%s learning_rate=%g num_leaves=%llu max_depth=%llu min_data_in_leaf=%llu "
-	    "verbosity=-1 force_col_wise=true",
+	    "min_sum_hessian_in_leaf=%g lambda_l2=%g lambda_l1=%g min_gain_to_split=%g "
+	    "bagging_fraction=%g feature_fraction=%g bagging_freq=1 seed=%llu verbosity=-1 force_col_wise=true",
 	    ObjectiveForLightGBM(options.task, n_classes), options.learning_rate,
 	    (unsigned long long)MaxValue<idx_t>(2, 1ULL << MinValue<idx_t>(options.max_depth, 10)),
-	    (unsigned long long)options.max_depth, (unsigned long long)MaxValue<idx_t>(options.min_samples_leaf, 1));
+	    (unsigned long long)options.max_depth, (unsigned long long)MaxValue<idx_t>(options.min_samples_leaf, 1),
+	    options.min_child_weight, options.reg_lambda, options.reg_alpha, options.min_split_gain, options.subsample,
+	    options.colsample_bytree, (unsigned long long)options.seed);
 	if (options.task == BoostTask::MULTICLASS) {
 		params += " num_class=" + std::to_string(n_classes);
 	}

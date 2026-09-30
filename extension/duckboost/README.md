@@ -122,7 +122,26 @@ SELECT duckboost_predict(model, features), duckboost_predict_proba(model, featur
 | `lightgbm` | Optional (`DUCKBOOST_WITH_LIGHTGBM`) | `booster_.save_model()` text | Yes |
 | `catboost` | Optional (`DUCKBOOST_WITH_CATBOOST`) | `save_model(..., format='json')` float trees | Yes |
 
-Native XGBoost / LightGBM linking is opt-in via `DUCKBOOST_WITH_*`. Linked builds train in-process through the vendor C API, then convert the dump into duckboost JSON. CatBoost remains import-only. Prefer `duckboost_import()` when you already train outside DuckDB; use `backend='reference'` for dependency-free experiments.
+Native XGBoost / LightGBM linking is opt-in via `DUCKBOOST_WITH_*`. Linked builds train in-process through the vendor C API, then convert the dump into duckboost JSON. CatBoost remains import-only. Prefer `duckboost_import()` when you already train outside DuckDB; use `backend='reference'` for dependency-free experiments (including feature NULLs/NaNs).
+
+### Reference trainer options
+
+| Key | Default | Notes |
+| --- | --- | --- |
+| `task` | `regression` | `regression` or `binary` (multiclass: import / native) |
+| `n_estimators` | `10` | Boosting rounds |
+| `max_depth` | `3` | Depth-wise trees |
+| `learning_rate` | `0.1` | Shrinkage (`eta` / `lr`) |
+| `max_bins` | `256` | Quantile candidate budget for thresholds |
+| `min_samples_leaf` | `1` | Min rows per child |
+| `min_child_weight` | `1` | Min hessian sum per child |
+| `reg_lambda` / `reg_alpha` | `1` / `0` | L2 / L1 on leaf weights |
+| `gamma` | `0` | Min split gain |
+| `subsample` / `colsample_bytree` | `1` / `1` | Row / column bagging per tree |
+| `early_stopping_rounds` | `0` | With `validation_fraction` (default `0.2` when early stopping set) |
+| `seed` | `0` | RNG seed for sampling / valid split |
+
+SQL `NULL` and IEEE NaN in feature lists are treated as missing. The reference trainer learns a per-split default direction (serialized as `default_left`), matching XGBoost’s missing-child behavior. Target `y` must still be non-NULL.
 
 ### Dump import notes
 
@@ -157,7 +176,10 @@ For `task: "multiclass"`, `n_classes >= 2`, optional `base_scores` holds per-cla
 
 - **Intended home**: out-of-tree community extension (heavy optional deps + ML surface area). Prototyped in-tree here for DuckDB 2.0 development.
 - **SQL export** mirrors orbital's `separate_trees` idea so DuckDB can evaluate ensemble members as independent columns.
-- **Reference trainer** is a didactic histogram/quantile-split GBDT (squared error + logistic). It is not a replacement for production XGBoost/LightGBM/CatBoost quality, but it exercises the full train → evaluate → SQL path.
+- **Reference trainer** is a second-order GBDT (squared error + logistic) with XGBoost-style learned
+  missing-value default directions, L1/L2/`gamma` regularization, row/column subsample, and optional
+  early stopping. It is still lighter than production XGBoost/LightGBM/CatBoost, but it exercises the
+  full train → evaluate → SQL path on real tabular data including NULLs/NaNs.
 - **Table macros** `duckboost_fit` / `duckboost_score` wrap `duckboost_train` / `duckboost_predict` with `query_table` for a compact SQL workflow.
 
 ## Roadmap

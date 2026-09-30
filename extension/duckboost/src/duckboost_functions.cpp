@@ -20,6 +20,7 @@
 #include "duckdb/parser/parsed_data/create_macro_info.hpp"
 
 #include <cmath>
+#include <limits>
 
 namespace duckdb {
 namespace duckboost {
@@ -76,7 +77,9 @@ vector<double> ReadFeatureList(Vector &list_vector, idx_t row) {
 	for (idx_t i = 0; i < entry.length; i++) {
 		auto child_idx = child_format.sel->get_index(entry.offset + i);
 		if (!child_format.validity.RowIsValid(child_idx)) {
-			throw InvalidInputException("duckboost: feature values cannot be NULL");
+			// SQL NULL → NaN so reference/native trainers can learn XGBoost-style default directions.
+			features.push_back(std::numeric_limits<double>::quiet_NaN());
+			continue;
 		}
 		features.push_back(child_data[child_idx]);
 	}

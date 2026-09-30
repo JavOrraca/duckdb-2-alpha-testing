@@ -33,12 +33,14 @@ string TreeToSQL(const BoostTree &tree, const vector<string> &feature_columns, i
 	auto feature = QuoteIdent(feature_columns[node.feature]);
 	auto left = TreeToSQL(tree, feature_columns, node.left);
 	auto right = TreeToSQL(tree, feature_columns, node.right);
+	auto missing_branch = node.default_left ? left : right;
 	if (node.compare == SplitCompare::EQUAL) {
-		// OneHot True (equal) → right; keep THEN/ELSE matching EvalTree.
-		return "CASE WHEN " + feature + " = " + FormatDouble(node.threshold) + " THEN " + right + " ELSE " + left +
-		       " END";
+		// OneHot True (equal) → right; NULL/NaN follow learned default_left.
+		return "CASE WHEN " + feature + " IS NULL OR isnan(" + feature + ") THEN " + missing_branch + " WHEN " +
+		       feature + " = " + FormatDouble(node.threshold) + " THEN " + right + " ELSE " + left + " END";
 	}
-	return "CASE WHEN " + feature + " < " + FormatDouble(node.threshold) + " THEN " + left + " ELSE " + right + " END";
+	return "CASE WHEN " + feature + " IS NULL OR isnan(" + feature + ") THEN " + missing_branch + " WHEN " + feature +
+	       " < " + FormatDouble(node.threshold) + " THEN " + left + " ELSE " + right + " END";
 }
 
 static constexpr uint64_t CTR_MAGIC_MULT = 0x4906ba494954cb65ULL;
@@ -285,7 +287,7 @@ bool BackendTrainingSupported(BoostBackend backend) {
 string BackendCapabilityNote(BoostBackend backend) {
 	switch (backend) {
 	case BoostBackend::REFERENCE:
-		return "in-process reference GBDT (train/predict/evaluate/to_sql)";
+		return "in-process reference GBDT with missing-value defaults (train/predict/evaluate/to_sql)";
 	case BoostBackend::XGBOOST:
 		if (NativeTrainerLinked(backend)) {
 			return "native train via XGBoost C API (dump→import); also duckboost_import dump_model JSON";
@@ -329,8 +331,26 @@ TrainOptions TrainOptions::FromMap(const unordered_map<string, string> &options)
 			result.learning_rate = std::stod(value);
 		} else if (key == "min_samples_leaf" || key == "min_data_in_leaf") {
 			result.min_samples_leaf = static_cast<idx_t>(std::stoull(value));
+		} else if (key == "min_child_weight") {
+			result.min_child_weight = std::stod(value);
 		} else if (key == "max_bins") {
 			result.max_bins = static_cast<idx_t>(std::stoull(value));
+		} else if (key == "reg_lambda" || key == "lambda" || key == "lambda_l2") {
+			result.reg_lambda = std::stod(value);
+		} else if (key == "reg_alpha" || key == "alpha" || key == "lambda_l1") {
+			result.reg_alpha = std::stod(value);
+		} else if (key == "min_split_gain" || key == "gamma") {
+			result.min_split_gain = std::stod(value);
+		} else if (key == "subsample" || key == "bagging_fraction") {
+			result.subsample = std::stod(value);
+		} else if (key == "colsample_bytree" || key == "colsample" || key == "feature_fraction") {
+			result.colsample_bytree = std::stod(value);
+		} else if (key == "validation_fraction" || key == "valid_fraction") {
+			result.validation_fraction = std::stod(value);
+		} else if (key == "early_stopping_rounds" || key == "early_stopping") {
+			result.early_stopping_rounds = static_cast<idx_t>(std::stoull(value));
+		} else if (key == "seed" || key == "random_seed") {
+			result.seed = static_cast<uint64_t>(std::stoull(value));
 		} else if (key == "feature_names") {
 			result.feature_names = StringUtil::Split(value, ',');
 			for (auto &name : result.feature_names) {
@@ -348,6 +368,27 @@ TrainOptions TrainOptions::FromMap(const unordered_map<string, string> &options)
 	}
 	if (!(result.learning_rate > 0)) {
 		throw InvalidInputException("duckboost: learning_rate must be > 0");
+	}
+	if (!(result.min_child_weight >= 0)) {
+		throw InvalidInputException("duckboost: min_child_weight must be >= 0");
+	}
+	if (!(result.reg_lambda >= 0) || !(result.reg_alpha >= 0) || !(result.min_split_gain >= 0)) {
+		throw InvalidInputException("duckboost: reg_lambda, reg_alpha, and min_split_gain must be >= 0");
+	}
+	if (!(result.subsample > 0 && result.subsample <= 1.0)) {
+		throw InvalidInputException("duckboost: subsample must be in (0, 1]");
+	}
+	if (!(result.colsample_bytree > 0 && result.colsample_bytree <= 1.0)) {
+		throw InvalidInputException("duckboost: colsample_bytree must be in (0, 1]");
+	}
+	if (!(result.validation_fraction >= 0 && result.validation_fraction < 1.0)) {
+		throw InvalidInputException("duckboost: validation_fraction must be in [0, 1)");
+	}
+	if (result.max_bins == 0) {
+		throw InvalidInputException("duckboost: max_bins must be > 0");
+	}
+	if (result.early_stopping_rounds > 0 && result.validation_fraction == 0) {
+		result.validation_fraction = 0.2;
 	}
 	return result;
 }
@@ -434,6 +475,9 @@ string BoostModel::ToJSON() const {
 			out << ",\"value\":" << FormatDouble(node.value);
 			if (node.compare == SplitCompare::EQUAL) {
 				out << ",\"compare\":\"equal\"";
+			}
+			if (!node.is_leaf) {
+				out << ",\"default_left\":" << (node.default_left ? "true" : "false");
 			}
 			out << '}';
 		}
@@ -604,6 +648,8 @@ BoostModel BoostModel::FromJSON(const string &json) {
 								auto cmp = StringUtil::Lower(p.ParseString());
 								node.compare = (cmp == "equal" || cmp == "eq" || cmp == "==") ? SplitCompare::EQUAL
 								                                                              : SplitCompare::LESS;
+							} else if (node_key == "default_left" || node_key == "missing_left") {
+								node.default_left = p.ParseBool();
 							} else {
 								p.SkipValue();
 							}
@@ -792,10 +838,13 @@ double BoostModel::EvalTree(const BoostTree &tree, const vector<double> &feature
 		if (node.feature >= features.size()) {
 			throw InvalidInputException("duckboost: feature index out of range during prediction");
 		}
-		if (node.compare == SplitCompare::EQUAL) {
-			node_idx = features[node.feature] == node.threshold ? node.right : node.left;
+		auto value = features[node.feature];
+		if (std::isnan(value)) {
+			node_idx = node.default_left ? node.left : node.right;
+		} else if (node.compare == SplitCompare::EQUAL) {
+			node_idx = value == node.threshold ? node.right : node.left;
 		} else {
-			node_idx = features[node.feature] < node.threshold ? node.left : node.right;
+			node_idx = value < node.threshold ? node.left : node.right;
 		}
 	}
 }

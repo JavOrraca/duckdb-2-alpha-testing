@@ -9,6 +9,7 @@
 #include "duckdb/common/numeric_utils.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
+#include "duckdb/common/types/value.hpp"
 #include "duckdb/common/vector/flat_vector.hpp"
 #include "duckdb/common/vector/list_vector.hpp"
 #include "duckdb/common/vector/map_vector.hpp"
@@ -729,6 +730,85 @@ struct BuildInfoData : public GlobalTableFunctionState {
 	idx_t offset = 0;
 };
 
+unordered_map<string, string> ValueMapToOptions(const Value &map_value) {
+	unordered_map<string, string> options;
+	if (map_value.IsNull()) {
+		return options;
+	}
+	for (auto &entry : MapValue::GetChildren(map_value)) {
+		auto &kv = StructValue::GetChildren(entry);
+		if (kv[0].IsNull() || kv[1].IsNull()) {
+			continue;
+		}
+		options[StringValue::Get(kv[0])] = StringValue::Get(kv[1]);
+	}
+	return options;
+}
+
+struct ImportanceBindData : public TableFunctionData {
+	vector<FeatureImportance> rows;
+};
+
+struct ImportanceData : public GlobalTableFunctionState {
+	idx_t offset = 0;
+};
+
+unique_ptr<FunctionData> ImportanceBind(ClientContext &, TableFunctionBindInput &input,
+                                        vector<LogicalType> &return_types, vector<Identifier> &names) {
+	names = {"variable", "feature_index", "gain", "cover", "frequency", "importance"};
+	return_types = {LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::DOUBLE,
+	                LogicalType::DOUBLE,  LogicalType::BIGINT, LogicalType::DOUBLE};
+	if (input.inputs.empty() || input.inputs[0].IsNull()) {
+		throw InvalidInputException("duckboost_importance: model must not be NULL");
+	}
+	unordered_map<string, string> option_map;
+	if (input.inputs.size() >= 2 && !input.inputs[1].IsNull()) {
+		option_map = ValueMapToOptions(input.inputs[1]);
+	}
+	for (auto &np : input.named_parameters) {
+		auto key = StringUtil::Lower(np.first.GetIdentifierName());
+		if (key == "options" && !np.second.IsNull()) {
+			auto named = ValueMapToOptions(np.second);
+			option_map.insert(named.begin(), named.end());
+		}
+	}
+	auto options = ImportanceOptions::FromMap(option_map);
+	auto model = BoostModel::FromJSON(StringValue::Get(input.inputs[0]));
+	auto result = make_uniq<ImportanceBindData>();
+	result->rows = ComputeFeatureImportance(model, options);
+	return std::move(result);
+}
+
+unique_ptr<GlobalTableFunctionState> ImportanceInit(ClientContext &, TableFunctionInitInput &) {
+	return make_uniq<ImportanceData>();
+}
+
+void ImportanceFunction(ClientContext &, TableFunctionInput &data, DataChunk &output) {
+	auto &bind = data.bind_data->Cast<ImportanceBindData>();
+	auto &state = data.global_state->Cast<ImportanceData>();
+	if (state.offset >= bind.rows.size()) {
+		return;
+	}
+	const idx_t remaining = bind.rows.size() - state.offset;
+	const idx_t count = MinValue<idx_t>(remaining, STANDARD_VECTOR_SIZE);
+	auto variable_writer = FlatVector::Writer<string_t>(output.data[0], count);
+	auto index_writer = FlatVector::Writer<int64_t>(output.data[1], count);
+	auto gain_writer = FlatVector::Writer<double>(output.data[2], count);
+	auto cover_writer = FlatVector::Writer<double>(output.data[3], count);
+	auto frequency_writer = FlatVector::Writer<int64_t>(output.data[4], count);
+	auto importance_writer = FlatVector::Writer<double>(output.data[5], count);
+	for (idx_t i = 0; i < count; i++) {
+		auto &row = bind.rows[state.offset + i];
+		variable_writer.WriteValue(StringVector::AddString(output.data[0], row.variable));
+		index_writer.WriteValue(NumericCast<int64_t>(row.feature_index));
+		gain_writer.WriteValue(row.gain);
+		cover_writer.WriteValue(row.cover);
+		frequency_writer.WriteValue(NumericCast<int64_t>(row.frequency));
+		importance_writer.WriteValue(row.importance);
+	}
+	state.offset += count;
+}
+
 unique_ptr<FunctionData> BuildInfoBind(ClientContext &, TableFunctionBindInput &, vector<LogicalType> &return_types,
                                        vector<Identifier> &names) {
 	names = {"name", "enabled", "notes"};
@@ -915,6 +995,15 @@ void RegisterDuckBoostFunctions(ExtensionLoader &loader) {
 
 	TableFunction build_info_fun("duckboost_build_info", {}, BuildInfoFunction, BuildInfoBind, BuildInfoInit);
 	loader.RegisterFunction(build_info_fun);
+
+	TableFunctionSet importance_set("duckboost_importance");
+	TableFunction importance_fun({LogicalType::VARCHAR}, ImportanceFunction, ImportanceBind, ImportanceInit);
+	importance_fun.named_parameters["options"] = LogicalType::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR);
+	importance_set.AddFunction(importance_fun);
+	TableFunction importance_opts({LogicalType::VARCHAR, LogicalType::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR)},
+	                              ImportanceFunction, ImportanceBind, ImportanceInit);
+	importance_set.AddFunction(importance_opts);
+	loader.RegisterFunction(importance_set);
 
 	RegisterDuckBoostMacros(loader);
 }

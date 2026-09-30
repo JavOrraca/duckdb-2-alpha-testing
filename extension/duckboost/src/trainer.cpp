@@ -346,6 +346,8 @@ idx_t BuildTree(BoostTree &tree, const vector<vector<double>> &x, const vector<d
 	node.threshold = split.threshold;
 	node.default_left = split.default_left;
 	node.compare = split.compare;
+	node.gain = split.gain;
+	node.cover = parent.h;
 	auto node_idx = tree.nodes.size();
 	tree.nodes.push_back(node);
 	tree.nodes[node_idx].left =
@@ -417,6 +419,7 @@ idx_t BuildTreeLeafWise(BoostTree &tree, const vector<vector<double>> &x, const 
 
 		auto left_stat = SumStats(gradients, hessians, left_rows);
 		auto right_stat = SumStats(gradients, hessians, right_rows);
+		auto parent_stat = SumStats(gradients, hessians, cur.rows);
 		idx_t left_idx = BuildLeaf(tree, LeafWeight(left_stat, options));
 		idx_t right_idx = BuildLeaf(tree, LeafWeight(right_stat, options));
 
@@ -427,6 +430,8 @@ idx_t BuildTreeLeafWise(BoostTree &tree, const vector<vector<double>> &x, const 
 		node.threshold = cur.split.threshold;
 		node.default_left = cur.split.default_left;
 		node.compare = cur.split.compare;
+		node.gain = cur.split.gain;
+		node.cover = parent_stat.h;
 		node.left = left_idx;
 		node.right = right_idx;
 

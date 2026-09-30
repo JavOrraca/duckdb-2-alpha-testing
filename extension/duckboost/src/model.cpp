@@ -5,6 +5,7 @@
 #include "duckdb/common/numeric_utils.hpp"
 #include "duckdb/common/string_util.hpp"
 
+#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <sstream>
@@ -287,7 +288,7 @@ bool BackendTrainingSupported(BoostBackend backend) {
 string BackendCapabilityNote(BoostBackend backend) {
 	switch (backend) {
 	case BoostBackend::REFERENCE:
-		return "in-process reference GBDT with missing-value defaults (train/predict/evaluate/to_sql)";
+		return "in-process reference GBDT (missing defaults, categoricals, multiclass, weights)";
 	case BoostBackend::XGBOOST:
 		if (NativeTrainerLinked(backend)) {
 			return "native train via XGBoost C API (dump→import); also duckboost_import dump_model JSON";
@@ -351,6 +352,28 @@ TrainOptions TrainOptions::FromMap(const unordered_map<string, string> &options)
 			result.early_stopping_rounds = static_cast<idx_t>(std::stoull(value));
 		} else if (key == "seed" || key == "random_seed") {
 			result.seed = static_cast<uint64_t>(std::stoull(value));
+		} else if (key == "n_classes" || key == "num_class") {
+			result.n_classes = static_cast<idx_t>(std::stoull(value));
+		} else if (key == "cat_features" || key == "categorical_features" || key == "categorical_feature") {
+			auto parts = StringUtil::Split(value, ',');
+			for (auto &part : parts) {
+				StringUtil::Trim(part);
+				if (part.empty()) {
+					continue;
+				}
+				result.cat_feature_tokens.push_back(part);
+				bool all_digits = !part.empty() && (part[0] == '-' || std::isdigit(static_cast<unsigned char>(part[0])));
+				for (idx_t i = 1; all_digits && i < part.size(); i++) {
+					if (!std::isdigit(static_cast<unsigned char>(part[i]))) {
+						all_digits = false;
+					}
+				}
+				if (all_digits && part[0] != '-') {
+					result.cat_features.push_back(static_cast<idx_t>(std::stoull(part)));
+				}
+			}
+		} else if (key == "class_weight" || key == "class_weights") {
+			result.class_weight = value;
 		} else if (key == "feature_names") {
 			result.feature_names = StringUtil::Split(value, ',');
 			for (auto &name : result.feature_names) {

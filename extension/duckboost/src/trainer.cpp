@@ -468,7 +468,8 @@ idx_t InferNClasses(const vector<double> &y, const TrainOptions &options) {
 	double max_label = -1;
 	for (auto v : y) {
 		if (!std::isfinite(v) || v < 0 || std::floor(v) != v) {
-			throw InvalidInputException("duckboost: multiclass labels must be finite non-negative integer class indices");
+			throw InvalidInputException(
+			    "duckboost: multiclass labels must be finite non-negative integer class indices");
 		}
 		max_label = MaxValue(max_label, v);
 	}

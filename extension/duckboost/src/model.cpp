@@ -362,7 +362,8 @@ TrainOptions TrainOptions::FromMap(const unordered_map<string, string> &options)
 					continue;
 				}
 				result.cat_feature_tokens.push_back(part);
-				bool all_digits = !part.empty() && (part[0] == '-' || std::isdigit(static_cast<unsigned char>(part[0])));
+				bool all_digits =
+				    !part.empty() && (part[0] == '-' || std::isdigit(static_cast<unsigned char>(part[0])));
 				for (idx_t i = 1; all_digits && i < part.size(); i++) {
 					if (!std::isdigit(static_cast<unsigned char>(part[i]))) {
 						all_digits = false;

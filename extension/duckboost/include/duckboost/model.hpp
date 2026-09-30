@@ -21,6 +21,9 @@ enum class BoostBackend : uint8_t { REFERENCE = 0, XGBOOST = 1, LIGHTGBM = 2, CA
 
 enum class BoostTask : uint8_t { REGRESSION = 0, BINARY = 1, MULTICLASS = 2 };
 
+//! DEPTH: classic level/depth-wise growth. LEAF: LightGBM-style leaf-wise with max_leaves.
+enum class GrowPolicy : uint8_t { DEPTH = 0, LEAF = 1 };
+
 //! LESS: feature < threshold → left (default). EQUAL: feature == threshold → right (CatBoost OneHot).
 enum class SplitCompare : uint8_t { LESS = 0, EQUAL = 1 };
 
@@ -109,6 +112,9 @@ struct TrainOptions {
 	//! Min sum of hessians in a child (XGBoost min_child_weight).
 	double min_child_weight = 1.0;
 	idx_t max_bins = 256;
+	GrowPolicy grow_policy = GrowPolicy::DEPTH;
+	//! Leaf budget for grow_policy=leaf (0 ⇒ default 31). Ignored for depth-wise.
+	idx_t max_leaves = 0;
 	//! L2 regularization on leaf weights.
 	double reg_lambda = 1.0;
 	//! L1 regularization on leaf weights.

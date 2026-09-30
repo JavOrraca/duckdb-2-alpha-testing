@@ -336,6 +336,17 @@ TrainOptions TrainOptions::FromMap(const unordered_map<string, string> &options)
 			result.min_child_weight = std::stod(value);
 		} else if (key == "max_bins") {
 			result.max_bins = static_cast<idx_t>(std::stoull(value));
+		} else if (key == "grow_policy" || key == "growth_policy") {
+			auto policy = StringUtil::Lower(value);
+			if (policy == "depth" || policy == "depthwise" || policy == "level" || policy == "levelwise") {
+				result.grow_policy = GrowPolicy::DEPTH;
+			} else if (policy == "leaf" || policy == "leafwise" || policy == "lossguide" || policy == "loss_guide") {
+				result.grow_policy = GrowPolicy::LEAF;
+			} else {
+				throw InvalidInputException("duckboost: grow_policy must be 'depth' or 'leaf'");
+			}
+		} else if (key == "max_leaves" || key == "num_leaves") {
+			result.max_leaves = static_cast<idx_t>(std::stoull(value));
 		} else if (key == "reg_lambda" || key == "lambda" || key == "lambda_l2") {
 			result.reg_lambda = std::stod(value);
 		} else if (key == "reg_alpha" || key == "alpha" || key == "lambda_l1") {

@@ -128,7 +128,7 @@ Native XGBoost / LightGBM linking is opt-in via `DUCKBOOST_WITH_*`. Linked build
 
 | Key | Default | Notes |
 | --- | --- | --- |
-| `task` | `regression` | `regression` or `binary` (multiclass: import / native) |
+| `task` | `regression` | `regression`, `binary`, or `multiclass` |
 | `n_estimators` | `10` | Boosting rounds |
 | `max_depth` | `3` | Depth-wise trees |
 | `learning_rate` | `0.1` | Shrinkage (`eta` / `lr`) |
@@ -140,8 +140,13 @@ Native XGBoost / LightGBM linking is opt-in via `DUCKBOOST_WITH_*`. Linked build
 | `subsample` / `colsample_bytree` | `1` / `1` | Row / column bagging per tree |
 | `early_stopping_rounds` | `0` | With `validation_fraction` (default `0.2` when early stopping set) |
 | `seed` | `0` | RNG seed for sampling / valid split |
+| `n_classes` | inferred | Multiclass class count override |
+| `cat_features` | _(none)_ | Comma-separated indices or `feature_names` for EQUAL splits |
+| `class_weight` | _(none)_ | `balanced` or comma-separated per-class multipliers |
 
-SQL `NULL` and IEEE NaN in feature lists are treated as missing. The reference trainer learns a per-split default direction (serialized as `default_left`), matching XGBoost’s missing-child behavior. Target `y` must still be non-NULL.
+Optional sample weights: `duckboost_train(y, features, weight [, options])`.
+
+SQL `NULL` and IEEE NaN in feature lists are treated as missing. The reference trainer learns a per-split default direction (serialized as `default_left`), matching XGBoost’s missing-child behavior. Target `y` must still be non-NULL. Multiclass uses softmax (`task: multiclass`); categorical columns use `compare: equal` splits.
 
 ### Dump import notes
 
@@ -176,10 +181,11 @@ For `task: "multiclass"`, `n_classes >= 2`, optional `base_scores` holds per-cla
 
 - **Intended home**: out-of-tree community extension (heavy optional deps + ML surface area). Prototyped in-tree here for DuckDB 2.0 development.
 - **SQL export** mirrors orbital's `separate_trees` idea so DuckDB can evaluate ensemble members as independent columns.
-- **Reference trainer** is a second-order GBDT (squared error + logistic) with XGBoost-style learned
-  missing-value default directions, L1/L2/`gamma` regularization, row/column subsample, and optional
-  early stopping. It is still lighter than production XGBoost/LightGBM/CatBoost, but it exercises the
-  full train → evaluate → SQL path on real tabular data including NULLs/NaNs.
+- **Reference trainer** is a second-order GBDT (squared error, logistic, softmax multiclass) with
+  XGBoost-style missing-value defaults, categorical EQUAL splits, sample/class weights, L1/L2/`gamma`
+  regularization, row/column subsample, and optional early stopping. It is still lighter than
+  production XGBoost/LightGBM/CatBoost, but covers the full train → evaluate → SQL path on dirty
+  tabular data.
 - **Table macros** `duckboost_fit` / `duckboost_score` wrap `duckboost_train` / `duckboost_predict` with `query_table` for a compact SQL workflow.
 
 ## Roadmap

@@ -14,36 +14,6 @@
 namespace duckdb {
 namespace duckboost {
 
-namespace {
-
-string QuoteIdent(const string &name) {
-	return "\"" + StringUtil::Replace(name, "\"", "\"\"") + "\"";
-}
-
-string TreeToSQL(const BoostTree &tree, const vector<string> &feature_columns, idx_t node_idx) {
-	if (node_idx >= tree.nodes.size()) {
-		throw InvalidInputException("duckboost: invalid tree node index in SQL export");
-	}
-	auto &node = tree.nodes[node_idx];
-	if (node.is_leaf) {
-		return FormatDouble(node.value);
-	}
-	if (node.feature >= feature_columns.size()) {
-		throw InvalidInputException("duckboost: feature index out of range in SQL export");
-	}
-	auto feature = QuoteIdent(feature_columns[node.feature]);
-	auto left = TreeToSQL(tree, feature_columns, node.left);
-	auto right = TreeToSQL(tree, feature_columns, node.right);
-	auto missing_branch = node.default_left ? left : right;
-	if (node.compare == SplitCompare::EQUAL) {
-		// OneHot True (equal) → right; NULL/NaN follow learned default_left.
-		return "CASE WHEN " + feature + " IS NULL OR isnan(" + feature + ") THEN " + missing_branch + " WHEN " +
-		       feature + " = " + FormatDouble(node.threshold) + " THEN " + right + " ELSE " + left + " END";
-	}
-	return "CASE WHEN " + feature + " IS NULL OR isnan(" + feature + ") THEN " + missing_branch + " WHEN " + feature +
-	       " < " + FormatDouble(node.threshold) + " THEN " + left + " ELSE " + right + " END";
-}
-
 static constexpr uint64_t CTR_MAGIC_MULT = 0x4906ba494954cb65ULL;
 
 uint64_t FeatureHashU64(double value) {
@@ -51,6 +21,8 @@ uint64_t FeatureHashU64(double value) {
 	auto as_i = static_cast<int64_t>(std::llround(value));
 	return static_cast<uint64_t>(static_cast<uint32_t>(static_cast<int32_t>(as_i)));
 }
+
+namespace {
 
 uint64_t CtrElementValue(const CtrCombineElement &element, const vector<double> &features) {
 	if (element.feature_index >= features.size()) {
@@ -68,6 +40,8 @@ uint64_t CtrElementValue(const CtrCombineElement &element, const vector<double> 
 		throw InvalidInputException("duckboost: unknown CTR combination element kind");
 	}
 }
+
+} // namespace
 
 uint64_t CombineCtrHash(const CtrFeatureSpec &ctr, const vector<double> &features) {
 	uint64_t hash = 0;
@@ -108,6 +82,8 @@ double CtrValueFromCounts(const CtrFeatureSpec &ctr, int64_t count_or_failures, 
 	throw NotImplementedException("duckboost: unsupported CTR type '%s'", ctr.ctr_type);
 }
 
+namespace {
+
 double EvaluateCtrValue(const CtrFeatureSpec &ctr, const vector<double> &features) {
 	auto key = CombineCtrHash(ctr, features);
 	unordered_map<uint64_t, idx_t> lookup;
@@ -125,6 +101,34 @@ double EvaluateCtrValue(const CtrFeatureSpec &ctr, const vector<double> &feature
 		}
 	}
 	return CtrValueFromCounts(ctr, primary, secondary);
+}
+
+string QuoteIdent(const string &name) {
+	return "\"" + StringUtil::Replace(name, "\"", "\"\"") + "\"";
+}
+
+string TreeToSQL(const BoostTree &tree, const vector<string> &feature_columns, idx_t node_idx) {
+	if (node_idx >= tree.nodes.size()) {
+		throw InvalidInputException("duckboost: invalid tree node index in SQL export");
+	}
+	auto &node = tree.nodes[node_idx];
+	if (node.is_leaf) {
+		return FormatDouble(node.value);
+	}
+	if (node.feature >= feature_columns.size()) {
+		throw InvalidInputException("duckboost: feature index out of range in SQL export");
+	}
+	auto feature = QuoteIdent(feature_columns[node.feature]);
+	auto left = TreeToSQL(tree, feature_columns, node.left);
+	auto right = TreeToSQL(tree, feature_columns, node.right);
+	auto missing_branch = node.default_left ? left : right;
+	if (node.compare == SplitCompare::EQUAL) {
+		// OneHot True (equal) → right; NULL/NaN follow learned default_left.
+		return "CASE WHEN " + feature + " IS NULL OR isnan(" + feature + ") THEN " + missing_branch + " WHEN " +
+		       feature + " = " + FormatDouble(node.threshold) + " THEN " + right + " ELSE " + left + " END";
+	}
+	return "CASE WHEN " + feature + " IS NULL OR isnan(" + feature + ") THEN " + missing_branch + " WHEN " + feature +
+	       " < " + FormatDouble(node.threshold) + " THEN " + left + " ELSE " + right + " END";
 }
 
 string CtrElementKindToString(CtrElementKind kind) {
@@ -434,8 +438,8 @@ bool BackendTrainingSupported(BoostBackend backend) {
 string BackendCapabilityNote(BoostBackend backend) {
 	switch (backend) {
 	case BoostBackend::REFERENCE:
-		return "in-process reference GBDT (ranking/lambdarank, poisson/huber/quantile, categoricals, multiclass, "
-		       "weights)";
+		return "in-process reference GBDT (train-time CTRs, ranking/lambdarank, poisson/huber/quantile, categoricals, "
+		       "multiclass, weights)";
 	case BoostBackend::XGBOOST:
 		if (NativeTrainerLinked(backend)) {
 			return "native train via XGBoost C API (dump→import); also duckboost_import dump_model JSON";
@@ -553,6 +557,38 @@ TrainOptions TrainOptions::FromMap(const unordered_map<string, string> &options)
 			for (auto &name : result.feature_names) {
 				StringUtil::Trim(name);
 			}
+		} else if (key == "ctr_types" || key == "ctr_type") {
+			result.ctr_types = value;
+		} else if (key == "ctr_prior") {
+			auto parts = StringUtil::Split(value, ',');
+			if (parts.empty() || parts.size() > 2) {
+				throw InvalidInputException("duckboost: ctr_prior must be 'num' or 'num,den'");
+			}
+			StringUtil::Trim(parts[0]);
+			result.ctr_prior_numerator = std::stod(parts[0]);
+			if (parts.size() == 2) {
+				StringUtil::Trim(parts[1]);
+				result.ctr_prior_denominator = std::stod(parts[1]);
+			}
+		} else if (key == "ctr_prior_numerator") {
+			result.ctr_prior_numerator = std::stod(value);
+		} else if (key == "ctr_prior_denominator") {
+			result.ctr_prior_denominator = std::stod(value);
+		} else if (key == "ctr_scale") {
+			result.ctr_scale = std::stod(value);
+		} else if (key == "ctr_shift") {
+			result.ctr_shift = std::stod(value);
+		} else if (key == "ctr_target_leakage" || key == "ctr_leakage") {
+			auto lower = StringUtil::Lower(value);
+			if (lower == "leave_one_out" || lower == "loo") {
+				result.ctr_target_leakage = CtrTargetLeakage::LEAVE_ONE_OUT;
+			} else if (lower == "expanding" || lower == "ordered") {
+				result.ctr_target_leakage = CtrTargetLeakage::EXPANDING;
+			} else if (lower == "none" || lower == "full" || lower == "global") {
+				result.ctr_target_leakage = CtrTargetLeakage::NONE;
+			} else {
+				throw InvalidInputException("duckboost: ctr_target_leakage must be leave_one_out, expanding, or none");
+			}
 		} else {
 			throw InvalidInputException("duckboost: unknown train option '%s'", entry.first);
 		}
@@ -592,6 +628,9 @@ TrainOptions TrainOptions::FromMap(const unordered_map<string, string> &options)
 	}
 	if (!(result.quantile_alpha > 0 && result.quantile_alpha < 1.0)) {
 		throw InvalidInputException("duckboost: quantile_alpha must be in (0, 1)");
+	}
+	if (!(result.ctr_prior_denominator > 0) || !(result.ctr_scale > 0)) {
+		throw InvalidInputException("duckboost: ctr_prior_denominator and ctr_scale must be > 0");
 	}
 	ResolveObjective(result.task, result.objective);
 	return result;

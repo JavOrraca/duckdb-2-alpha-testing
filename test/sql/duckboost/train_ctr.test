@@ -1,0 +1,122 @@
+# name: test/sql/duckboost/train_ctr.test
+# description: duckboost train-time CatBoost-style CTR features
+# group: [duckboost]
+
+require duckboost
+
+# Binary labels with a strong categorical signal
+statement ok
+CREATE TABLE ctr_train AS
+SELECT
+	(i % 4)::DOUBLE AS cat,
+	(i % 7)::DOUBLE AS x_num,
+	CASE WHEN (i % 4) IN (0, 1) THEN 1.0 ELSE 0.0 END AS y
+FROM range(80) t(i);
+
+statement ok
+CREATE TABLE ctr_models AS
+SELECT duckboost_train(
+	y,
+	[cat, x_num],
+	MAP {
+		'backend': 'reference',
+		'task': 'binary',
+		'cat_features': '0',
+		'ctr_types': 'Borders',
+		'ctr_prior': '0.5,1',
+		'ctr_target_leakage': 'leave_one_out',
+		'n_estimators': '30',
+		'max_depth': '3',
+		'learning_rate': '0.2',
+		'feature_names': 'cat,x_num',
+		'seed': '4'
+	}
+) AS model
+FROM ctr_train;
+
+query I
+SELECT model LIKE '%"ctr_features"%' AND model LIKE '%"ctr_type":"Borders"%' AND model LIKE '%"n_raw_features":2%'
+FROM ctr_models;
+----
+true
+
+# High-signal category should score above low-signal category
+query I
+SELECT
+	duckboost_predict(model, [0.0, 1.0]) > duckboost_predict(model, [3.0, 1.0])
+FROM ctr_models;
+----
+true
+
+# Counter CTR works on the same categoricals
+statement ok
+CREATE TABLE counter_models AS
+SELECT duckboost_train(
+	y,
+	[cat, x_num],
+	MAP {
+		'task': 'binary',
+		'cat_features': '0',
+		'ctr_types': 'Counter',
+		'n_estimators': '20',
+		'max_depth': '2',
+		'learning_rate': '0.2',
+		'seed': '2'
+	}
+) AS model
+FROM ctr_train;
+
+query I
+SELECT model LIKE '%"ctr_type":"Counter"%' AND model LIKE '%counter_denominator%'
+FROM counter_models;
+----
+true
+
+query I
+SELECT duckboost_predict(model, [1.0, 0.0]) IS NOT NULL FROM counter_models;
+----
+true
+
+# SQL export matches predict for CTR models
+statement ok
+CREATE TABLE ctr_pred_rows AS
+SELECT * FROM (VALUES (0.0, 1.0), (3.0, 1.0), (1.0, 2.0)) t(cat, x_num);
+
+statement ok
+SET VARIABLE train_ctr_sql = (
+	SELECT duckboost_to_sql(model, 'ctr_pred_rows', ['cat', 'x_num'], MAP {'separate_trees': 'false', 'prediction_alias': 'pred'})
+	FROM ctr_models
+);
+
+statement ok
+CREATE TABLE train_ctr_sql_pred AS
+SELECT row_number() OVER () AS rn, pred::DOUBLE AS pred FROM query(getvariable('train_ctr_sql'));
+
+statement ok
+CREATE TABLE train_ctr_native_pred AS
+SELECT row_number() OVER () AS rn, duckboost_predict(model, [cat, x_num]) AS pred
+FROM ctr_models, ctr_pred_rows;
+
+query I
+SELECT count(*) = 3 AND bool_and(abs(n.pred - s.pred) < 1e-9)
+FROM train_ctr_native_pred n
+JOIN train_ctr_sql_pred s USING (rn);
+----
+true
+
+# ctr_types without cat_features fails
+statement error
+SELECT duckboost_train(y, [cat, x_num], MAP {'ctr_types': 'Borders', 'n_estimators': '2'})
+FROM ctr_train;
+----
+<REGEX>:.*ctr_types requires cat_features.*
+
+# Borders requires binary labels
+statement error
+SELECT duckboost_train(
+	x_num, [cat],
+	MAP {'task': 'regression', 'cat_features': '0', 'ctr_types': 'Borders', 'n_estimators': '2'}
+)
+FROM ctr_train;
+----
+<REGEX>:.*Borders CTR requires task 'binary'.*

@@ -5,6 +5,8 @@
 #include "duckdb/common/numeric_utils.hpp"
 #include "duckdb/common/string_util.hpp"
 
+#include "duckdb/common/unordered_map.hpp"
+
 #include <algorithm>
 #include <cctype>
 #include <cmath>
@@ -23,6 +25,7 @@ typedef uint64_t bst_ulong;
 const char *XGBGetLastError();
 int XGDMatrixCreateFromMat(const float *data, bst_ulong nrow, bst_ulong ncol, float missing, DMatrixHandle *out);
 int XGDMatrixSetFloatInfo(DMatrixHandle handle, const char *field, const float *array, bst_ulong len);
+int XGDMatrixSetUIntInfo(DMatrixHandle handle, const char *field, const unsigned *array, bst_ulong len);
 int XGDMatrixFree(DMatrixHandle handle);
 int XGBoosterCreate(const DMatrixHandle dmats[], bst_ulong len, BoosterHandle *out);
 int XGBoosterFree(BoosterHandle handle);
@@ -62,6 +65,9 @@ int LGBM_BoosterFree(BoosterHandle handle);
 #endif
 #ifndef C_API_DTYPE_FLOAT32
 #define C_API_DTYPE_FLOAT32 0
+#endif
+#ifndef C_API_DTYPE_INT32
+#define C_API_DTYPE_INT32 2
 #endif
 #endif
 
@@ -112,6 +118,10 @@ string ObjectiveForXGBoost(BoostTask task, BoostObjective objective, idx_t n_cla
 		return "reg:pseudohubererror";
 	case BoostObjective::QUANTILE:
 		return "reg:quantileerror";
+	case BoostObjective::LAMBDARANK:
+		return "rank:ndcg";
+	case BoostObjective::PAIRWISE:
+		return "rank:pairwise";
 	case BoostObjective::SQUAREDERROR:
 	case BoostObjective::AUTO:
 	default:
@@ -135,6 +145,9 @@ string ObjectiveForLightGBM(BoostTask task, BoostObjective objective, idx_t n_cl
 		return "huber";
 	case BoostObjective::QUANTILE:
 		return "quantile";
+	case BoostObjective::LAMBDARANK:
+	case BoostObjective::PAIRWISE:
+		return "lambdarank";
 	case BoostObjective::SQUAREDERROR:
 	case BoostObjective::AUTO:
 	default:
@@ -150,6 +163,9 @@ string EvalMetricForObjective(BoostObjective objective) {
 		return "mlogloss";
 	case BoostObjective::QUANTILE:
 		return "mae";
+	case BoostObjective::LAMBDARANK:
+	case BoostObjective::PAIRWISE:
+		return "ndcg";
 	case BoostObjective::POISSON:
 	case BoostObjective::HUBER:
 	case BoostObjective::SQUAREDERROR:
@@ -164,7 +180,7 @@ struct RowSplit {
 	vector<idx_t> valid_rows;
 };
 
-RowSplit MakeValidationSplit(idx_t n_rows, const TrainOptions &options) {
+RowSplit MakeValidationSplit(idx_t n_rows, const TrainOptions &options, const vector<int64_t> &groups = {}) {
 	RowSplit split;
 	split.train_rows.resize(n_rows);
 	std::iota(split.train_rows.begin(), split.train_rows.end(), 0);
@@ -178,6 +194,41 @@ RowSplit MakeValidationSplit(idx_t n_rows, const TrainOptions &options) {
 		state ^= state << 17;
 		return state;
 	};
+	auto objective = ResolveObjective(options.task, options.objective);
+	const bool ranking = objective == BoostObjective::LAMBDARANK || objective == BoostObjective::PAIRWISE;
+	if (ranking && groups.size() == n_rows) {
+		unordered_map<int64_t, vector<idx_t>> by_group;
+		for (idx_t i = 0; i < n_rows; i++) {
+			by_group[groups[i]].push_back(i);
+		}
+		vector<int64_t> group_ids;
+		group_ids.reserve(by_group.size());
+		for (auto &entry : by_group) {
+			group_ids.push_back(entry.first);
+		}
+		if (group_ids.size() >= 2) {
+			for (idx_t i = 0; i < group_ids.size(); i++) {
+				idx_t j = i + static_cast<idx_t>(next() % (group_ids.size() - i));
+				std::swap(group_ids[i], group_ids[j]);
+			}
+			idx_t valid_g = MaxValue<idx_t>(
+			    1, static_cast<idx_t>(std::floor(options.validation_fraction * static_cast<double>(group_ids.size()))));
+			valid_g = MinValue<idx_t>(valid_g, group_ids.size() - 1);
+			split.train_rows.clear();
+			split.valid_rows.clear();
+			for (idx_t g = 0; g < group_ids.size(); g++) {
+				auto &rows = by_group[group_ids[g]];
+				if (g < valid_g) {
+					split.valid_rows.insert(split.valid_rows.end(), rows.begin(), rows.end());
+				} else {
+					split.train_rows.insert(split.train_rows.end(), rows.begin(), rows.end());
+				}
+			}
+			std::sort(split.train_rows.begin(), split.train_rows.end());
+			std::sort(split.valid_rows.begin(), split.valid_rows.end());
+			return split;
+		}
+	}
 	auto shuffled = split.train_rows;
 	for (idx_t i = 0; i < shuffled.size(); i++) {
 		idx_t j = i + static_cast<idx_t>(next() % (shuffled.size() - i));
@@ -191,6 +242,37 @@ RowSplit MakeValidationSplit(idx_t n_rows, const TrainOptions &options) {
 	std::sort(split.train_rows.begin(), split.train_rows.end());
 	std::sort(split.valid_rows.begin(), split.valid_rows.end());
 	return split;
+}
+
+vector<idx_t> OrderRowsByGroup(const vector<idx_t> &rows, const vector<int64_t> &groups) {
+	auto ordered = rows;
+	std::stable_sort(ordered.begin(), ordered.end(), [&](idx_t a, idx_t b) {
+		if (groups[a] != groups[b]) {
+			return groups[a] < groups[b];
+		}
+		return a < b;
+	});
+	return ordered;
+}
+
+vector<unsigned> BuildGroupSizes(const vector<idx_t> &ordered_rows, const vector<int64_t> &groups) {
+	vector<unsigned> sizes;
+	if (ordered_rows.empty()) {
+		return sizes;
+	}
+	int64_t current = groups[ordered_rows[0]];
+	unsigned count = 1;
+	for (idx_t i = 1; i < ordered_rows.size(); i++) {
+		if (groups[ordered_rows[i]] != current) {
+			sizes.push_back(count);
+			current = groups[ordered_rows[i]];
+			count = 1;
+		} else {
+			count++;
+		}
+	}
+	sizes.push_back(count);
+	return sizes;
 }
 
 void MaterializeRowSubset(const vector<vector<double>> &x, const vector<double> &y, const vector<float> &weights,
@@ -383,22 +465,28 @@ string DumpXGBoostJSON(BoosterHandle booster, idx_t ncol, const vector<idx_t> &c
 }
 
 BoostModel TrainWithXGBoost(const vector<double> &y, const vector<vector<double>> &x, const TrainOptions &options,
-                            const vector<double> &weights) {
+                            const vector<double> &weights, const vector<int64_t> &groups) {
 	EnsureRectangular(y, x);
 	const idx_t nrow = y.size();
 	const idx_t ncol = x[0].size();
 	const idx_t n_classes = InferClassCount(y, options);
 	const auto objective = ResolveObjective(options.task, options.objective);
+	const bool ranking = objective == BoostObjective::LAMBDARANK || objective == BoostObjective::PAIRWISE;
+	if (ranking && groups.size() != nrow) {
+		throw InvalidInputException("duckboost: xgboost ranking requires a group id for every row");
+	}
 	const idx_t weight_classes = options.task == BoostTask::BINARY ? 2 : n_classes;
 	auto cat_indices = ResolveNativeCatFeatures(options, ncol);
 	auto weight_f = ResolveNativeWeights(y, options, weights, weight_classes);
-	auto split = MakeValidationSplit(nrow, options);
+	auto split = MakeValidationSplit(nrow, options, groups);
+	auto train_ordered = ranking ? OrderRowsByGroup(split.train_rows, groups) : split.train_rows;
+	auto valid_ordered = ranking ? OrderRowsByGroup(split.valid_rows, groups) : split.valid_rows;
 
 	vector<float> train_flat, train_labels, train_weights;
-	MaterializeRowSubset(x, y, weight_f, split.train_rows, ncol, train_flat, train_labels, train_weights);
+	MaterializeRowSubset(x, y, weight_f, train_ordered, ncol, train_flat, train_labels, train_weights);
 
 	DMatrixHandle dtrain = nullptr;
-	if (XGDMatrixCreateFromMat(train_flat.data(), static_cast<bst_ulong>(split.train_rows.size()),
+	if (XGDMatrixCreateFromMat(train_flat.data(), static_cast<bst_ulong>(train_ordered.size()),
 	                           static_cast<bst_ulong>(ncol), std::numeric_limits<float>::quiet_NaN(), &dtrain) != 0) {
 		ThrowXGBoostError("XGDMatrixCreateFromMat(train)");
 	}
@@ -411,12 +499,21 @@ BoostModel TrainWithXGBoost(const vector<double> &y, const vector<vector<double>
 		XGDMatrixFree(dtrain);
 		ThrowXGBoostError("XGDMatrixSetFloatInfo(weight)");
 	}
+	vector<unsigned> train_group_sizes;
+	if (ranking) {
+		train_group_sizes = BuildGroupSizes(train_ordered, groups);
+		if (XGDMatrixSetUIntInfo(dtrain, "group", train_group_sizes.data(),
+		                         static_cast<bst_ulong>(train_group_sizes.size())) != 0) {
+			XGDMatrixFree(dtrain);
+			ThrowXGBoostError("XGDMatrixSetUIntInfo(group)");
+		}
+	}
 
 	DMatrixHandle dvalid = nullptr;
 	vector<float> valid_flat, valid_labels, valid_weights;
-	if (!split.valid_rows.empty()) {
-		MaterializeRowSubset(x, y, weight_f, split.valid_rows, ncol, valid_flat, valid_labels, valid_weights);
-		if (XGDMatrixCreateFromMat(valid_flat.data(), static_cast<bst_ulong>(split.valid_rows.size()),
+	if (!valid_ordered.empty()) {
+		MaterializeRowSubset(x, y, weight_f, valid_ordered, ncol, valid_flat, valid_labels, valid_weights);
+		if (XGDMatrixCreateFromMat(valid_flat.data(), static_cast<bst_ulong>(valid_ordered.size()),
 		                           static_cast<bst_ulong>(ncol), std::numeric_limits<float>::quiet_NaN(),
 		                           &dvalid) != 0) {
 			XGDMatrixFree(dtrain);
@@ -427,6 +524,15 @@ BoostModel TrainWithXGBoost(const vector<double> &y, const vector<vector<double>
 			XGDMatrixFree(dvalid);
 			XGDMatrixFree(dtrain);
 			ThrowXGBoostError("XGDMatrixSetFloatInfo(valid label)");
+		}
+		if (ranking) {
+			auto valid_group_sizes = BuildGroupSizes(valid_ordered, groups);
+			if (XGDMatrixSetUIntInfo(dvalid, "group", valid_group_sizes.data(),
+			                         static_cast<bst_ulong>(valid_group_sizes.size())) != 0) {
+				XGDMatrixFree(dvalid);
+				XGDMatrixFree(dtrain);
+				ThrowXGBoostError("XGDMatrixSetUIntInfo(valid group)");
+			}
 		}
 	}
 
@@ -467,7 +573,11 @@ BoostModel TrainWithXGBoost(const vector<double> &y, const vector<vector<double>
 	set_param("colsample_bytree", std::to_string(options.colsample_bytree));
 	set_param("seed", std::to_string(options.seed));
 	set_param("objective", ObjectiveForXGBoost(options.task, options.objective, n_classes));
-	set_param("eval_metric", EvalMetricForObjective(objective));
+	if (ranking && options.ndcg_at > 0) {
+		set_param("eval_metric", "ndcg@" + std::to_string(options.ndcg_at));
+	} else {
+		set_param("eval_metric", EvalMetricForObjective(objective));
+	}
 	if (objective == BoostObjective::HUBER) {
 		set_param("huber_slope", std::to_string(options.huber_delta));
 	}
@@ -553,7 +663,13 @@ BoostModel TrainWithXGBoost(const vector<double> &y, const vector<vector<double>
 		import_options.n_classes = n_classes;
 		import_options.n_classes_set = true;
 	}
-	return ImportXGBoostJSON(dump, import_options);
+	auto model = ImportXGBoostJSON(dump, import_options);
+	if (ranking) {
+		model.task = BoostTask::RANKING;
+		model.objective = objective;
+		model.ndcg_at = options.ndcg_at;
+	}
+	return model;
 }
 
 #endif // XGBoost linked
@@ -594,20 +710,26 @@ string SaveLightGBMModel(BoosterHandle booster, int num_iteration) {
 }
 
 BoostModel TrainWithLightGBM(const vector<double> &y, const vector<vector<double>> &x, const TrainOptions &options,
-                             const vector<double> &weights) {
+                             const vector<double> &weights, const vector<int64_t> &groups) {
 	EnsureRectangular(y, x);
 	const idx_t nrow = y.size();
 	const idx_t ncol = x[0].size();
 	const idx_t n_classes = InferClassCount(y, options);
 	const auto objective = ResolveObjective(options.task, options.objective);
+	const bool ranking = objective == BoostObjective::LAMBDARANK || objective == BoostObjective::PAIRWISE;
+	if (ranking && groups.size() != nrow) {
+		throw InvalidInputException("duckboost: lightgbm ranking requires a group id for every row");
+	}
 	const idx_t weight_classes = options.task == BoostTask::BINARY ? 2 : n_classes;
 	auto cat_indices = ResolveNativeCatFeatures(options, ncol);
 	auto weight_f = ResolveNativeWeights(y, options, weights, weight_classes);
-	auto split = MakeValidationSplit(nrow, options);
+	auto split = MakeValidationSplit(nrow, options, groups);
+	auto train_ordered = ranking ? OrderRowsByGroup(split.train_rows, groups) : split.train_rows;
+	auto valid_ordered = ranking ? OrderRowsByGroup(split.valid_rows, groups) : split.valid_rows;
 
 	vector<double> train_flat;
 	vector<float> train_labels, train_weights;
-	MaterializeRowSubsetDouble(x, y, weight_f, split.train_rows, ncol, train_flat, train_labels, train_weights);
+	MaterializeRowSubsetDouble(x, y, weight_f, train_ordered, ncol, train_flat, train_labels, train_weights);
 
 	string dataset_params = "max_bin=" + std::to_string(MaxValue<idx_t>(options.max_bins, 2));
 	if (!cat_indices.empty()) {
@@ -620,7 +742,7 @@ BoostModel TrainWithLightGBM(const vector<double> &y, const vector<vector<double
 		}
 	}
 
-	auto train_nrow = NumericCast<int32_t>(split.train_rows.size());
+	auto train_nrow = NumericCast<int32_t>(train_ordered.size());
 	auto ncol_i = NumericCast<int32_t>(ncol);
 
 	DatasetHandle dataset = nullptr;
@@ -636,6 +758,16 @@ BoostModel TrainWithLightGBM(const vector<double> &y, const vector<vector<double
 		LGBM_DatasetFree(dataset);
 		ThrowLightGBMError("LGBM_DatasetSetField(weight)");
 	}
+	vector<int32_t> train_group_sizes_i32;
+	if (ranking) {
+		auto sizes = BuildGroupSizes(train_ordered, groups);
+		train_group_sizes_i32.assign(sizes.begin(), sizes.end());
+		if (LGBM_DatasetSetField(dataset, "group", train_group_sizes_i32.data(),
+		                         NumericCast<int32_t>(train_group_sizes_i32.size()), C_API_DTYPE_INT32) != 0) {
+			LGBM_DatasetFree(dataset);
+			ThrowLightGBMError("LGBM_DatasetSetField(group)");
+		}
+	}
 	if (!options.feature_names.empty() && options.feature_names.size() == ncol) {
 		vector<const char *> fnames(ncol);
 		for (idx_t i = 0; i < ncol; i++) {
@@ -650,9 +782,10 @@ BoostModel TrainWithLightGBM(const vector<double> &y, const vector<vector<double
 	DatasetHandle valid_dataset = nullptr;
 	vector<double> valid_flat;
 	vector<float> valid_labels, valid_weights;
-	if (!split.valid_rows.empty()) {
-		MaterializeRowSubsetDouble(x, y, weight_f, split.valid_rows, ncol, valid_flat, valid_labels, valid_weights);
-		auto valid_nrow = NumericCast<int32_t>(split.valid_rows.size());
+	vector<int32_t> valid_group_sizes_i32;
+	if (!valid_ordered.empty()) {
+		MaterializeRowSubsetDouble(x, y, weight_f, valid_ordered, ncol, valid_flat, valid_labels, valid_weights);
+		auto valid_nrow = NumericCast<int32_t>(valid_ordered.size());
 		if (LGBM_DatasetCreateFromMat(valid_flat.data(), C_API_DTYPE_FLOAT64, valid_nrow, ncol_i, 1,
 		                              dataset_params.c_str(), dataset, &valid_dataset) != 0) {
 			LGBM_DatasetFree(dataset);
@@ -662,6 +795,16 @@ BoostModel TrainWithLightGBM(const vector<double> &y, const vector<vector<double
 			LGBM_DatasetFree(valid_dataset);
 			LGBM_DatasetFree(dataset);
 			ThrowLightGBMError("LGBM_DatasetSetField(valid label)");
+		}
+		if (ranking) {
+			auto sizes = BuildGroupSizes(valid_ordered, groups);
+			valid_group_sizes_i32.assign(sizes.begin(), sizes.end());
+			if (LGBM_DatasetSetField(valid_dataset, "group", valid_group_sizes_i32.data(),
+			                         NumericCast<int32_t>(valid_group_sizes_i32.size()), C_API_DTYPE_INT32) != 0) {
+				LGBM_DatasetFree(valid_dataset);
+				LGBM_DatasetFree(dataset);
+				ThrowLightGBMError("LGBM_DatasetSetField(valid group)");
+			}
 		}
 	}
 
@@ -688,6 +831,9 @@ BoostModel TrainWithLightGBM(const vector<double> &y, const vector<vector<double
 		params += " alpha=" + std::to_string(options.huber_delta);
 	} else if (objective == BoostObjective::QUANTILE) {
 		params += " alpha=" + std::to_string(options.quantile_alpha);
+	}
+	if (ranking && options.ndcg_at > 0) {
+		params += " eval_at=" + std::to_string(options.ndcg_at);
 	}
 
 	BoosterHandle booster = nullptr;
@@ -760,7 +906,13 @@ BoostModel TrainWithLightGBM(const vector<double> &y, const vector<vector<double
 		import_options.n_classes = n_classes;
 		import_options.n_classes_set = true;
 	}
-	return ImportLightGBMText(dump, import_options);
+	auto model = ImportLightGBMText(dump, import_options);
+	if (ranking) {
+		model.task = BoostTask::RANKING;
+		model.objective = objective;
+		model.ndcg_at = options.ndcg_at;
+	}
+	return model;
 }
 
 #endif // LightGBM linked
@@ -822,7 +974,7 @@ bool NativeTrainerLinked(BoostBackend backend) {
 }
 
 BoostModel TrainNative(const vector<double> &y, const vector<vector<double>> &x, const TrainOptions &options,
-                       const vector<double> &weights) {
+                       const vector<double> &weights, const vector<int64_t> &groups) {
 	if (!NativeTrainerCompiled(options.backend)) {
 		throw NotImplementedException("duckboost: native training for backend '%s' is not linked in this build. "
 		                              "Configure with -DDUCKBOOST_WITH_%s=ON (and install the vendor library), "
@@ -832,6 +984,7 @@ BoostModel TrainNative(const vector<double> &y, const vector<vector<double>> &x,
 	}
 
 #if defined(DUCKBOOST_NATIVE_STUB)
+	(void)groups;
 	throw NotImplementedException("duckboost: native trainer for backend '%s' is compiled as a stub "
 	                              "(DUCKBOOST_NATIVE_STUB_ONLY). Rebuild with the vendor library linked, "
 	                              "or use duckboost_import() / backend='reference'.",
@@ -841,13 +994,13 @@ BoostModel TrainNative(const vector<double> &y, const vector<vector<double>> &x,
 	switch (options.backend) {
 	case BoostBackend::XGBOOST:
 #if defined(DUCKBOOST_WITH_XGBOOST) && !defined(DUCKBOOST_NATIVE_STUB)
-		return TrainWithXGBoost(y, x, options, weights);
+		return TrainWithXGBoost(y, x, options, weights, groups);
 #else
 		break;
 #endif
 	case BoostBackend::LIGHTGBM:
 #if defined(DUCKBOOST_WITH_LIGHTGBM) && !defined(DUCKBOOST_NATIVE_STUB)
-		return TrainWithLightGBM(y, x, options, weights);
+		return TrainWithLightGBM(y, x, options, weights, groups);
 #else
 		break;
 #endif

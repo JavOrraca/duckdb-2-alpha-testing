@@ -20,9 +20,9 @@ bool NativeTrainerCompiled(BoostBackend backend);
 bool NativeTrainerLinked(BoostBackend backend);
 
 //! Train using a vendor library when linked; stub / unlinked builds throw NotImplementedException.
-//! weights empty ⇒ unit weights.
+//! weights empty ⇒ unit weights. groups required for ranking objectives.
 BoostModel TrainNative(const vector<double> &y, const vector<vector<double>> &x, const TrainOptions &options,
-                       const vector<double> &weights = {});
+                       const vector<double> &weights = {}, const vector<int64_t> &groups = {});
 
 } // namespace duckboost
 } // namespace duckdb

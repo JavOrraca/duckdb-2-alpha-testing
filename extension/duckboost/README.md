@@ -128,10 +128,11 @@ Native XGBoost / LightGBM linking is opt-in via `DUCKBOOST_WITH_*`. Linked build
 
 | Key | Default | Notes |
 | --- | --- | --- |
-| `task` | `regression` | `regression`, `binary`, or `multiclass` |
-| `objective` | `auto` | `auto` (from task), `squarederror`, `logistic`, `softmax`, `poisson`, `huber`, `quantile`. Legacy: `objective: binary` still sets `task`. |
+| `task` | `regression` | `regression`, `binary`, `multiclass`, or `ranking` |
+| `objective` | `auto` | `auto` (from task), `squarederror`, `logistic`, `softmax`, `poisson`, `huber`, `quantile`, `lambdarank`, `pairwise`. Legacy: `objective: binary` still sets `task`. |
 | `huber_delta` | `1` | Huber threshold (`delta`); not L1 `alpha` |
 | `quantile_alpha` | `0.5` | Pinball quantile in `(0, 1)` |
+| `ndcg_at` | `0` | NDCG truncation for ranking (0 = full list) |
 | `n_estimators` | `10` | Boosting rounds |
 | `max_depth` | `3` | Depth-wise trees |
 | `learning_rate` | `0.1` | Shrinkage (`eta` / `lr`) |
@@ -150,6 +151,16 @@ Native XGBoost / LightGBM linking is opt-in via `DUCKBOOST_WITH_*`. Linked build
 | `class_weight` | _(none)_ | `balanced` or comma-separated per-class multipliers |
 
 Optional sample weights: `duckboost_train(y, features, weight [, options])`.
+
+Learning-to-rank: pass a `BIGINT` group / query id (before optional weight):
+
+```sql
+SELECT duckboost_train(y, [f1, f2], qid, MAP {'task': 'ranking', 'objective': 'lambdarank', 'ndcg_at': '10'})
+FROM docs;
+SELECT duckboost_evaluate_agg(model, y, [f1, f2], qid, MAP {'metric': 'ndcg'}) FROM models, docs;
+```
+
+`duckboost_predict` returns a raw ranking score (higher = more relevant). Early stopping keeps whole queries in train or valid.
 
 SQL `NULL` and IEEE NaN in feature lists are treated as missing. The reference trainer learns a per-split default direction (serialized as `default_left`), matching XGBoost’s missing-child behavior. Target `y` must still be non-NULL. Multiclass uses softmax (`task: multiclass`); categorical columns use `compare: equal` splits. Poisson predictions / SQL export apply `exp(raw)`; Huber and quantile keep the raw score as the mean/quantile estimate.
 
@@ -187,10 +198,10 @@ For `task: "multiclass"`, `n_classes >= 2`, optional `base_scores` holds per-cla
 - **Intended home**: out-of-tree community extension (heavy optional deps + ML surface area). Prototyped in-tree here for DuckDB 2.0 development.
 - **SQL export** mirrors orbital's `separate_trees` idea so DuckDB can evaluate ensemble members as independent columns.
 - **Reference trainer** is a second-order histogram GBDT (squared error, logistic, softmax, poisson,
-  huber, quantile) with XGBoost-style missing-value defaults, categorical EQUAL splits, depth- or
-  leaf-wise growth, sample/class weights, L1/L2/`gamma`, row/column subsample, and optional early
-  stopping. Linked XGBoost/LightGBM bridges forward objectives, early stopping, weights, categoricals,
-  and leaf-wise knobs when available.
+  huber, quantile, lambdarank/pairwise) with XGBoost-style missing-value defaults, categorical EQUAL
+  splits, depth- or leaf-wise growth, sample/class weights, L1/L2/`gamma`, row/column subsample, and
+  optional early stopping. Linked XGBoost/LightGBM bridges forward objectives (including ranking
+  groups), early stopping, weights, categoricals, and leaf-wise knobs when available.
 - **Table macros** `duckboost_fit` / `duckboost_score` wrap `duckboost_train` / `duckboost_predict` with `query_table` for a compact SQL workflow.
 
 ## Roadmap
@@ -200,4 +211,4 @@ For `task: "multiclass"`, `n_classes >= 2`, optional `base_scores` holds per-cla
 - [x] Vendor C API bridges for XGBoost / LightGBM (train → dump → import into `BoostModel`)
 - [x] Community publish kit (`community/description.yml`, `scripts/extract_duckboost_oot.sh`, dual-mode CMake)
 - [x] Orphan publish surface `cursor/duckboost-community-oot-0c09` + submit-ready descriptor (`community/SUBMIT.md`)
-- [ ] Open PR on `duckdb/community-extensions` with `extensions/duckboost/description.yml`
+- [ ] Open PR on `duckdb/community-extensions` with `extensions/duckboost/description.yml` (**hold until official DuckDB 2.0 release**)

@@ -4,9 +4,11 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/numeric_utils.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/common/unordered_map.hpp"
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <functional>
 #include <limits>
 #include <numeric>
 #include <unordered_set>
@@ -753,8 +755,218 @@ vector<idx_t> SelectGrowRows(const vector<idx_t> &train_rows, double subsample, 
 	return grow_rows;
 }
 
+double RankGain(double relevance) {
+	return std::pow(2.0, relevance) - 1.0;
+}
+
+double RankDiscount(idx_t pos) {
+	return 1.0 / std::log2(static_cast<double>(pos) + 2.0);
+}
+
+struct RankItem {
+	idx_t row;
+	double relevance;
+	double score;
+};
+
+double IdealDCG(vector<double> relevances, idx_t k) {
+	std::sort(relevances.begin(), relevances.end(), std::greater<double>());
+	idx_t n = k == 0 ? relevances.size() : MinValue<idx_t>(k, relevances.size());
+	double dcg = 0;
+	for (idx_t i = 0; i < n; i++) {
+		dcg += RankGain(relevances[i]) * RankDiscount(i);
+	}
+	return dcg;
+}
+
+double NDCGForGroup(vector<RankItem> items, idx_t k) {
+	if (items.empty()) {
+		return 0;
+	}
+	vector<double> relevances;
+	relevances.reserve(items.size());
+	for (auto &item : items) {
+		relevances.push_back(item.relevance);
+	}
+	double idcg = IdealDCG(relevances, k);
+	if (idcg <= 0) {
+		return 0;
+	}
+	std::sort(items.begin(), items.end(), [](const RankItem &a, const RankItem &b) {
+		if (a.score != b.score) {
+			return a.score > b.score;
+		}
+		return a.row < b.row;
+	});
+	idx_t n = k == 0 ? items.size() : MinValue<idx_t>(k, items.size());
+	double dcg = 0;
+	for (idx_t i = 0; i < n; i++) {
+		dcg += RankGain(items[i].relevance) * RankDiscount(i);
+	}
+	return dcg / idcg;
+}
+
+double AveragePrecisionForGroup(vector<RankItem> items) {
+	if (items.empty()) {
+		return 0;
+	}
+	std::sort(items.begin(), items.end(), [](const RankItem &a, const RankItem &b) {
+		if (a.score != b.score) {
+			return a.score > b.score;
+		}
+		return a.row < b.row;
+	});
+	double hits = 0;
+	double sum_prec = 0;
+	for (idx_t i = 0; i < items.size(); i++) {
+		if (items[i].relevance > 0) {
+			hits += 1;
+			sum_prec += hits / static_cast<double>(i + 1);
+		}
+	}
+	return hits <= 0 ? 0 : sum_prec / hits;
+}
+
+unordered_map<int64_t, vector<idx_t>> GroupRowsById(const vector<idx_t> &rows, const vector<int64_t> &groups) {
+	unordered_map<int64_t, vector<idx_t>> by_group;
+	for (auto row : rows) {
+		by_group[groups[row]].push_back(row);
+	}
+	return by_group;
+}
+
+void SplitRowsByGroups(const vector<int64_t> &groups, double validation_fraction, SimpleRng &rng,
+                       vector<idx_t> &train_rows, vector<idx_t> &valid_rows) {
+	unordered_map<int64_t, vector<idx_t>> by_group;
+	for (idx_t i = 0; i < groups.size(); i++) {
+		by_group[groups[i]].push_back(i);
+	}
+	vector<int64_t> group_ids;
+	group_ids.reserve(by_group.size());
+	for (auto &entry : by_group) {
+		group_ids.push_back(entry.first);
+	}
+	for (idx_t i = 0; i < group_ids.size(); i++) {
+		idx_t j = i + rng.Bounded(group_ids.size() - i);
+		std::swap(group_ids[i], group_ids[j]);
+	}
+	idx_t valid_g =
+	    MaxValue<idx_t>(1, static_cast<idx_t>(std::floor(validation_fraction * static_cast<double>(group_ids.size()))));
+	valid_g = MinValue<idx_t>(valid_g, group_ids.size() - 1);
+	train_rows.clear();
+	valid_rows.clear();
+	for (idx_t g = 0; g < group_ids.size(); g++) {
+		auto &rows = by_group[group_ids[g]];
+		if (g < valid_g) {
+			valid_rows.insert(valid_rows.end(), rows.begin(), rows.end());
+		} else {
+			train_rows.insert(train_rows.end(), rows.begin(), rows.end());
+		}
+	}
+	std::sort(train_rows.begin(), train_rows.end());
+	std::sort(valid_rows.begin(), valid_rows.end());
+}
+
+double EvalRankingMetric(const vector<double> &y, const vector<double> &prediction, const vector<idx_t> &rows,
+                         const vector<int64_t> &groups, idx_t ndcg_at, bool use_map) {
+	auto by_group = GroupRowsById(rows, groups);
+	if (by_group.empty()) {
+		return std::numeric_limits<double>::infinity();
+	}
+	double sum = 0;
+	for (auto &entry : by_group) {
+		vector<RankItem> items;
+		items.reserve(entry.second.size());
+		for (auto row : entry.second) {
+			items.push_back({row, y[row], prediction[row]});
+		}
+		sum += use_map ? AveragePrecisionForGroup(std::move(items)) : NDCGForGroup(std::move(items), ndcg_at);
+	}
+	// Return loss-style metric (lower is better) for early stopping.
+	return 1.0 - sum / static_cast<double>(by_group.size());
+}
+
+void FillLambdaRankGradients(BoostObjective objective, const vector<double> &y, const vector<double> &prediction,
+                             const vector<double> &weights, const vector<int64_t> &groups, const vector<idx_t> &rows,
+                             idx_t ndcg_at, vector<double> &gradients, vector<double> &hessians) {
+	gradients.assign(y.size(), 0);
+	hessians.assign(y.size(), 0);
+	auto by_group = GroupRowsById(rows, groups);
+	const bool use_delta_ndcg = objective == BoostObjective::LAMBDARANK;
+
+	for (auto &entry : by_group) {
+		auto &group_rows = entry.second;
+		if (group_rows.size() < 2) {
+			continue;
+		}
+		vector<RankItem> items;
+		items.reserve(group_rows.size());
+		for (auto row : group_rows) {
+			items.push_back({row, y[row], prediction[row]});
+		}
+		std::sort(items.begin(), items.end(), [](const RankItem &a, const RankItem &b) {
+			if (a.score != b.score) {
+				return a.score > b.score;
+			}
+			return a.row < b.row;
+		});
+		unordered_map<idx_t, idx_t> position;
+		for (idx_t i = 0; i < items.size(); i++) {
+			position[items[i].row] = i;
+		}
+		vector<double> relevances;
+		relevances.reserve(items.size());
+		for (auto &item : items) {
+			relevances.push_back(item.relevance);
+		}
+		double idcg = IdealDCG(relevances, ndcg_at);
+		if (idcg <= 0) {
+			idcg = 1.0;
+		}
+
+		for (idx_t i = 0; i < group_rows.size(); i++) {
+			for (idx_t j = i + 1; j < group_rows.size(); j++) {
+				idx_t ri = group_rows[i];
+				idx_t rj = group_rows[j];
+				if (y[ri] == y[rj]) {
+					continue;
+				}
+				idx_t high = y[ri] > y[rj] ? ri : rj;
+				idx_t low = y[ri] > y[rj] ? rj : ri;
+				double score_diff = prediction[high] - prediction[low];
+				// Pairwise logistic: push high-label scores up via leaf = -G/H.
+				double rho = 1.0 / (1.0 + std::exp(score_diff));
+				double weight = std::sqrt(weights[high] * weights[low]);
+				double delta = 1.0;
+				if (use_delta_ndcg) {
+					idx_t pos_high = position[high];
+					idx_t pos_low = position[low];
+					double gain_high = RankGain(y[high]);
+					double gain_low = RankGain(y[low]);
+					delta = std::fabs((gain_high - gain_low) * (RankDiscount(pos_high) - RankDiscount(pos_low))) / idcg;
+					if (!(delta > 0)) {
+						delta = 1e-6;
+					}
+				}
+				// g_high = -ρ·Δ so leaf = -G/H raises scores for higher-label docs.
+				double lambda = weight * rho * delta;
+				double hess = weight * std::max(rho * (1.0 - rho), 1e-3) * delta;
+				gradients[high] -= lambda;
+				gradients[low] += lambda;
+				hessians[high] += hess;
+				hessians[low] += hess;
+			}
+		}
+	}
+	for (idx_t i = 0; i < hessians.size(); i++) {
+		if (hessians[i] <= 0) {
+			hessians[i] = 1e-3;
+		}
+	}
+}
+
 BoostModel TrainReference(const vector<double> &y, const vector<vector<double>> &x, const TrainOptions &options,
-                          const vector<double> &weights_in) {
+                          const vector<double> &weights_in, const vector<int64_t> &groups) {
 	if (y.size() != x.size()) {
 		throw InvalidInputException("duckboost: y/x row count mismatch");
 	}
@@ -791,24 +1003,50 @@ BoostModel TrainReference(const vector<double> &y, const vector<vector<double>> 
 	auto weights = NormalizeWeights(y, weights_in);
 	auto cat_set = ResolveCatFeatures(options, n_features, model.feature_names);
 
+	const bool is_ranking = objective == BoostObjective::LAMBDARANK || objective == BoostObjective::PAIRWISE;
+	if (is_ranking) {
+		if (groups.size() != y.size()) {
+			throw InvalidInputException("duckboost: ranking requires a group id for every row");
+		}
+		for (auto label : y) {
+			if (!std::isfinite(label) || label < 0) {
+				throw InvalidInputException("duckboost: ranking labels must be finite and >= 0");
+			}
+		}
+		model.ndcg_at = options.ndcg_at;
+	} else if (!groups.empty() && groups.size() != y.size()) {
+		throw InvalidInputException("duckboost: group count (%llu) must match row count (%llu)",
+		                            (unsigned long long)groups.size(), (unsigned long long)y.size());
+	}
+
 	SimpleRng rng(options.seed);
 	vector<idx_t> all_rows(y.size());
 	std::iota(all_rows.begin(), all_rows.end(), 0);
 	vector<idx_t> train_rows = all_rows;
 	vector<idx_t> valid_rows;
 	if (options.validation_fraction > 0 && options.early_stopping_rounds > 0 && y.size() >= 4) {
-		auto shuffled = all_rows;
-		for (idx_t i = 0; i < shuffled.size(); i++) {
-			idx_t j = i + rng.Bounded(shuffled.size() - i);
-			std::swap(shuffled[i], shuffled[j]);
+		if (is_ranking) {
+			unordered_map<int64_t, idx_t> group_count;
+			for (auto g : groups) {
+				group_count[g]++;
+			}
+			if (group_count.size() >= 2) {
+				SplitRowsByGroups(groups, options.validation_fraction, rng, train_rows, valid_rows);
+			}
+		} else {
+			auto shuffled = all_rows;
+			for (idx_t i = 0; i < shuffled.size(); i++) {
+				idx_t j = i + rng.Bounded(shuffled.size() - i);
+				std::swap(shuffled[i], shuffled[j]);
+			}
+			idx_t valid_n = MaxValue<idx_t>(
+			    1, static_cast<idx_t>(std::floor(options.validation_fraction * static_cast<double>(y.size()))));
+			valid_n = MinValue<idx_t>(valid_n, y.size() - 1);
+			valid_rows.assign(shuffled.begin(), shuffled.begin() + valid_n);
+			train_rows.assign(shuffled.begin() + valid_n, shuffled.end());
+			std::sort(train_rows.begin(), train_rows.end());
+			std::sort(valid_rows.begin(), valid_rows.end());
 		}
-		idx_t valid_n = MaxValue<idx_t>(
-		    1, static_cast<idx_t>(std::floor(options.validation_fraction * static_cast<double>(y.size()))));
-		valid_n = MinValue<idx_t>(valid_n, y.size() - 1);
-		valid_rows.assign(shuffled.begin(), shuffled.begin() + valid_n);
-		train_rows.assign(shuffled.begin() + valid_n, shuffled.end());
-		std::sort(train_rows.begin(), train_rows.end());
-		std::sort(valid_rows.begin(), valid_rows.end());
 	}
 
 	double best_valid = std::numeric_limits<double>::infinity();
@@ -885,6 +1123,46 @@ BoostModel TrainReference(const vector<double> &y, const vector<vector<double>> 
 		}
 		if (!valid_rows.empty() && best_rounds > 0 && best_rounds * n_classes < model.trees.size()) {
 			model.trees.resize(best_rounds * n_classes);
+		}
+		return model;
+	}
+
+	if (is_ranking) {
+		if (!options.class_weight.empty()) {
+			throw InvalidInputException("duckboost: class_weight is not supported for ranking");
+		}
+		model.base_score = 0;
+		model.n_classes = 1;
+		vector<double> prediction(y.size(), 0);
+		for (idx_t round = 0; round < options.n_estimators; round++) {
+			vector<double> gradients;
+			vector<double> hessians;
+			FillLambdaRankGradients(objective, y, prediction, weights, groups, train_rows, options.ndcg_at, gradients,
+			                        hessians);
+			auto grow_rows = SelectGrowRows(train_rows, options.subsample, rng);
+			auto feature_subset = SampleFeatures(n_features, options.colsample_bytree, rng);
+			BoostTree tree;
+			GrowTree(tree, x, gradients, hessians, grow_rows, feature_subset, cat_set, options);
+			for (idx_t i = 0; i < y.size(); i++) {
+				prediction[i] += options.learning_rate * ApplyTree(tree, x[i]);
+			}
+			model.trees.push_back(std::move(tree));
+			if (!valid_rows.empty()) {
+				auto metric = EvalRankingMetric(y, prediction, valid_rows, groups, options.ndcg_at, /*use_map=*/false);
+				if (metric < best_valid - 1e-12) {
+					best_valid = metric;
+					best_rounds = model.trees.size();
+					rounds_since_improve = 0;
+				} else {
+					rounds_since_improve++;
+					if (rounds_since_improve >= options.early_stopping_rounds) {
+						break;
+					}
+				}
+			}
+		}
+		if (!valid_rows.empty() && best_rounds > 0 && best_rounds < model.trees.size()) {
+			model.trees.resize(best_rounds);
 		}
 		return model;
 	}
@@ -983,12 +1261,12 @@ BoostModel TrainReference(const vector<double> &y, const vector<vector<double>> 
 } // namespace
 
 BoostModel TrainModel(const vector<double> &y, const vector<vector<double>> &x, const TrainOptions &options,
-                      const vector<double> &weights) {
+                      const vector<double> &weights, const vector<int64_t> &groups) {
 	if (options.backend == BoostBackend::REFERENCE) {
-		return TrainReference(y, x, options, weights);
+		return TrainReference(y, x, options, weights, groups);
 	}
 	if (NativeTrainerCompiled(options.backend)) {
-		return TrainNative(y, x, options, weights);
+		return TrainNative(y, x, options, weights, groups);
 	}
 	throw NotImplementedException(
 	    "duckboost: native training for backend '%s' is not linked in this build. "
@@ -999,7 +1277,7 @@ BoostModel TrainModel(const vector<double> &y, const vector<vector<double>> &x, 
 }
 
 double EvaluateModel(const BoostModel &model, const vector<double> &y, const vector<vector<double>> &x,
-                     const EvalOptions &options) {
+                     const EvalOptions &options, const vector<int64_t> &groups) {
 	if (y.size() != x.size()) {
 		throw InvalidInputException("duckboost: y/x row count mismatch during evaluate");
 	}
@@ -1010,9 +1288,26 @@ double EvaluateModel(const BoostModel &model, const vector<double> &y, const vec
 	if (metric.empty() || metric == "auto") {
 		if (model.task == BoostTask::BINARY || model.task == BoostTask::MULTICLASS) {
 			metric = "accuracy";
+		} else if (model.task == BoostTask::RANKING) {
+			metric = "ndcg";
 		} else {
 			metric = "rmse";
 		}
+	}
+
+	if (metric == "ndcg" || metric == "map") {
+		if (groups.size() != y.size()) {
+			throw InvalidInputException("duckboost: metric '%s' requires a group id for every row", metric);
+		}
+		idx_t k = options.ndcg_at > 0 ? options.ndcg_at : model.ndcg_at;
+		vector<double> scores(y.size());
+		for (idx_t i = 0; i < y.size(); i++) {
+			scores[i] = model.Predict(x[i]);
+		}
+		vector<idx_t> all_rows(y.size());
+		std::iota(all_rows.begin(), all_rows.end(), 0);
+		// EvalRankingMetric returns 1 - mean metric; invert for user-facing NDCG/MAP.
+		return 1.0 - EvalRankingMetric(y, scores, all_rows, groups, k, metric == "map");
 	}
 
 	if (metric == "rmse") {
@@ -1066,8 +1361,8 @@ double EvaluateModel(const BoostModel &model, const vector<double> &y, const vec
 		}
 		return loss / static_cast<double>(y.size());
 	}
-	throw InvalidInputException("duckboost: unknown metric '%s' (expected auto, rmse, mae, accuracy, logloss)",
-	                            options.metric);
+	throw InvalidInputException(
+	    "duckboost: unknown metric '%s' (expected auto, rmse, mae, accuracy, logloss, ndcg, map)", options.metric);
 }
 
 } // namespace duckboost

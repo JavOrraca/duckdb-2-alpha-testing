@@ -115,7 +115,9 @@ struct TrainDataset {
 	vector<double> y;
 	vector<vector<double>> x;
 	vector<double> weights;
+	vector<int64_t> groups;
 	bool has_weights = false;
+	bool has_groups = false;
 	TrainOptions options;
 	bool options_set = false;
 };
@@ -157,28 +159,65 @@ void TrainUpdate(Vector inputs[], AggregateInputData &, idx_t input_count, Vecto
 	y_vector.ToUnifiedFormat(count, y_format);
 	auto y_data = UnifiedVectorFormat::GetData<double>(y_format);
 
-	// Signatures:
+	// Signatures (group is BIGINT so it does not collide with weight DOUBLE):
 	// (y, features)
 	// (y, features, options MAP)
 	// (y, features, weight DOUBLE)
 	// (y, features, weight DOUBLE, options MAP)
+	// (y, features, group BIGINT)
+	// (y, features, group BIGINT, options MAP)
+	// (y, features, group BIGINT, weight DOUBLE)
+	// (y, features, group BIGINT, weight DOUBLE, options MAP)
+	bool has_group = false;
 	bool has_weight = false;
+	idx_t group_arg = 0;
+	idx_t weight_arg = 0;
 	idx_t options_arg = 0;
 	if (input_count == 3) {
-		if (inputs[2].GetType().id() == LogicalTypeId::MAP) {
+		auto tid = inputs[2].GetType().id();
+		if (tid == LogicalTypeId::MAP) {
 			options_arg = 2;
+		} else if (tid == LogicalTypeId::BIGINT) {
+			has_group = true;
+			group_arg = 2;
 		} else {
 			has_weight = true;
+			weight_arg = 2;
 		}
-	} else if (input_count >= 4) {
+	} else if (input_count == 4) {
+		if (inputs[2].GetType().id() == LogicalTypeId::BIGINT) {
+			has_group = true;
+			group_arg = 2;
+			if (inputs[3].GetType().id() == LogicalTypeId::MAP) {
+				options_arg = 3;
+			} else {
+				has_weight = true;
+				weight_arg = 3;
+			}
+		} else {
+			has_weight = true;
+			weight_arg = 2;
+			options_arg = 3;
+		}
+	} else if (input_count >= 5) {
+		has_group = true;
+		group_arg = 2;
 		has_weight = true;
-		options_arg = 3;
+		weight_arg = 3;
+		options_arg = 4;
+	}
+
+	UnifiedVectorFormat group_format;
+	const int64_t *group_data = nullptr;
+	if (has_group) {
+		inputs[group_arg].ToUnifiedFormat(count, group_format);
+		group_data = UnifiedVectorFormat::GetData<int64_t>(group_format);
 	}
 
 	UnifiedVectorFormat weight_format;
 	const double *weight_data = nullptr;
 	if (has_weight) {
-		inputs[2].ToUnifiedFormat(count, weight_format);
+		inputs[weight_arg].ToUnifiedFormat(count, weight_format);
 		weight_data = UnifiedVectorFormat::GetData<double>(weight_format);
 	}
 
@@ -200,6 +239,14 @@ void TrainUpdate(Vector inputs[], AggregateInputData &, idx_t input_count, Vecto
 		}
 		state.data->y.push_back(y_data[y_idx]);
 		state.data->x.push_back(ReadFeatureList(x_vector, i));
+		if (has_group) {
+			auto g_idx = group_format.sel->get_index(i);
+			if (!group_format.validity.RowIsValid(g_idx)) {
+				throw InvalidInputException("duckboost: group id cannot be NULL");
+			}
+			state.data->groups.push_back(group_data[g_idx]);
+			state.data->has_groups = true;
+		}
 		if (has_weight) {
 			auto w_idx = weight_format.sel->get_index(i);
 			if (!weight_format.validity.RowIsValid(w_idx)) {
@@ -235,6 +282,10 @@ void TrainCombine(Vector &source, Vector &target, AggregateInputData &, idx_t co
 			dst.data->weights.insert(dst.data->weights.end(), src.data->weights.begin(), src.data->weights.end());
 			dst.data->has_weights = true;
 		}
+		if (src.data->has_groups) {
+			dst.data->groups.insert(dst.data->groups.end(), src.data->groups.begin(), src.data->groups.end());
+			dst.data->has_groups = true;
+		}
 	}
 }
 
@@ -252,16 +303,21 @@ void TrainFinalize(Vector &state_vector, AggregateFinalizeInputData &, Vector &r
 		}
 		auto options = state.data->options_set ? state.data->options : TrainOptions();
 		const vector<double> empty_weights;
+		const vector<int64_t> empty_groups;
 		auto model = TrainModel(state.data->y, state.data->x, options,
-		                        state.data->has_weights ? state.data->weights : empty_weights);
+		                        state.data->has_weights ? state.data->weights : empty_weights,
+		                        state.data->has_groups ? state.data->groups : empty_groups);
 		writer.WriteValue(StringVector::AddString(result, model.ToJSON()));
 	}
 }
 
-AggregateFunction GetTrainFunction(bool with_weight, bool with_options) {
+AggregateFunction GetTrainFunction(bool with_group, bool with_weight, bool with_options) {
 	auto feature_type = LogicalType::LIST(LogicalType::DOUBLE);
 	auto options_type = LogicalType::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR);
 	vector<LogicalType> args = {LogicalType::DOUBLE, feature_type};
+	if (with_group) {
+		args.push_back(LogicalType::BIGINT);
+	}
 	if (with_weight) {
 		args.push_back(LogicalType::DOUBLE);
 	}
@@ -277,6 +333,9 @@ AggregateFunction GetTrainFunction(bool with_weight, bool with_options) {
 	fun.GetSignature().GetParameter(0).SetName("y");
 	fun.GetSignature().GetParameter(1).SetName("features");
 	idx_t next = 2;
+	if (with_group) {
+		fun.GetSignature().GetParameter(next++).SetName("group");
+	}
 	if (with_weight) {
 		fun.GetSignature().GetParameter(next++).SetName("weight");
 	}
@@ -390,6 +449,8 @@ void EvaluateFunction(DataChunk &args, ExpressionState &, Vector &result) {
 struct EvaluateDataset {
 	vector<double> y;
 	vector<vector<double>> x;
+	vector<int64_t> groups;
+	bool has_groups = false;
 	string model_json;
 	EvalOptions options;
 	bool options_set = false;
@@ -426,6 +487,31 @@ void EvaluateAggUpdate(Vector inputs[], AggregateInputData &, idx_t input_count,
 	auto model_data = UnifiedVectorFormat::GetData<string_t>(model_format);
 	auto y_data = UnifiedVectorFormat::GetData<double>(y_format);
 
+	// (model, y, features [, options])
+	// (model, y, features, group BIGINT [, options])
+	bool has_group = false;
+	idx_t group_arg = 0;
+	idx_t options_arg = 0;
+	if (input_count == 4) {
+		if (inputs[3].GetType().id() == LogicalTypeId::BIGINT) {
+			has_group = true;
+			group_arg = 3;
+		} else {
+			options_arg = 3;
+		}
+	} else if (input_count >= 5) {
+		has_group = true;
+		group_arg = 3;
+		options_arg = 4;
+	}
+
+	UnifiedVectorFormat group_format;
+	const int64_t *group_data = nullptr;
+	if (has_group) {
+		inputs[group_arg].ToUnifiedFormat(count, group_format);
+		group_data = UnifiedVectorFormat::GetData<int64_t>(group_format);
+	}
+
 	for (idx_t i = 0; i < count; i++) {
 		auto &state = *states[state_format.sel->get_index(i)];
 		if (!state.data) {
@@ -440,12 +526,20 @@ void EvaluateAggUpdate(Vector inputs[], AggregateInputData &, idx_t input_count,
 			state.data->model_json = model_data[model_idx].GetString();
 			state.data->model_set = true;
 		}
-		if (input_count >= 4 && !state.data->options_set) {
-			state.data->options = EvalOptions::FromMap(MapVectorToOptions(inputs[3], i));
+		if (options_arg > 0 && !state.data->options_set) {
+			state.data->options = EvalOptions::FromMap(MapVectorToOptions(inputs[options_arg], i));
 			state.data->options_set = true;
 		}
 		state.data->y.push_back(y_data[y_idx]);
 		state.data->x.push_back(ReadFeatureList(inputs[2], i));
+		if (has_group) {
+			auto g_idx = group_format.sel->get_index(i);
+			if (!group_format.validity.RowIsValid(g_idx)) {
+				throw InvalidInputException("duckboost: group id cannot be NULL in evaluate_agg");
+			}
+			state.data->groups.push_back(group_data[g_idx]);
+			state.data->has_groups = true;
+		}
 	}
 }
 
@@ -475,6 +569,10 @@ void EvaluateAggCombine(Vector &source, Vector &target, AggregateInputData &, id
 		}
 		dst.data->y.insert(dst.data->y.end(), src.data->y.begin(), src.data->y.end());
 		dst.data->x.insert(dst.data->x.end(), src.data->x.begin(), src.data->x.end());
+		if (src.data->has_groups) {
+			dst.data->groups.insert(dst.data->groups.end(), src.data->groups.begin(), src.data->groups.end());
+			dst.data->has_groups = true;
+		}
 	}
 }
 
@@ -496,14 +594,19 @@ void EvaluateAggFinalize(Vector &state_vector, AggregateFinalizeInputData &, Vec
 		if (options.metric.empty()) {
 			options.metric = "auto";
 		}
-		writer.WriteValue(EvaluateModel(model, state.data->y, state.data->x, options));
+		const vector<int64_t> empty_groups;
+		writer.WriteValue(EvaluateModel(model, state.data->y, state.data->x, options,
+		                                state.data->has_groups ? state.data->groups : empty_groups));
 	}
 }
 
-AggregateFunction GetEvaluateAggFunction(bool with_options) {
+AggregateFunction GetEvaluateAggFunction(bool with_group, bool with_options) {
 	auto feature_type = LogicalType::LIST(LogicalType::DOUBLE);
 	auto options_type = LogicalType::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR);
 	vector<LogicalType> args = {LogicalType::VARCHAR, LogicalType::DOUBLE, feature_type};
+	if (with_group) {
+		args.push_back(LogicalType::BIGINT);
+	}
 	if (with_options) {
 		args.push_back(options_type);
 	}
@@ -516,8 +619,12 @@ AggregateFunction GetEvaluateAggFunction(bool with_options) {
 	fun.GetSignature().GetParameter(0).SetName("model");
 	fun.GetSignature().GetParameter(1).SetName("y");
 	fun.GetSignature().GetParameter(2).SetName("features");
+	idx_t next = 3;
+	if (with_group) {
+		fun.GetSignature().GetParameter(next++).SetName("group");
+	}
 	if (with_options) {
-		fun.GetSignature().GetParameter(3).SetName("options");
+		fun.GetSignature().GetParameter(next).SetName("options");
 	}
 	return fun;
 }
@@ -718,10 +825,15 @@ void RegisterDuckBoostMacros(ExtensionLoader &loader) {
 
 void RegisterDuckBoostFunctions(ExtensionLoader &loader) {
 	AggregateFunctionSet train_set("duckboost_train");
-	train_set.AddFunction(GetTrainFunction(false, false));
-	train_set.AddFunction(GetTrainFunction(false, true));
-	train_set.AddFunction(GetTrainFunction(true, false));
-	train_set.AddFunction(GetTrainFunction(true, true));
+	// with_group, with_weight, with_options
+	train_set.AddFunction(GetTrainFunction(false, false, false));
+	train_set.AddFunction(GetTrainFunction(false, false, true));
+	train_set.AddFunction(GetTrainFunction(false, true, false));
+	train_set.AddFunction(GetTrainFunction(false, true, true));
+	train_set.AddFunction(GetTrainFunction(true, false, false));
+	train_set.AddFunction(GetTrainFunction(true, false, true));
+	train_set.AddFunction(GetTrainFunction(true, true, false));
+	train_set.AddFunction(GetTrainFunction(true, true, true));
 	loader.RegisterFunction(train_set);
 
 	ScalarFunctionSet predict_set("duckboost_predict");
@@ -759,8 +871,11 @@ void RegisterDuckBoostFunctions(ExtensionLoader &loader) {
 	loader.RegisterFunction(evaluate_set);
 
 	AggregateFunctionSet evaluate_agg_set("duckboost_evaluate_agg");
-	evaluate_agg_set.AddFunction(GetEvaluateAggFunction(false));
-	evaluate_agg_set.AddFunction(GetEvaluateAggFunction(true));
+	// with_group, with_options
+	evaluate_agg_set.AddFunction(GetEvaluateAggFunction(false, false));
+	evaluate_agg_set.AddFunction(GetEvaluateAggFunction(false, true));
+	evaluate_agg_set.AddFunction(GetEvaluateAggFunction(true, false));
+	evaluate_agg_set.AddFunction(GetEvaluateAggFunction(true, true));
 	loader.RegisterFunction(evaluate_agg_set);
 
 	ScalarFunctionSet to_sql_set("duckboost_to_sql");

@@ -19,9 +19,9 @@ namespace duckboost {
 
 enum class BoostBackend : uint8_t { REFERENCE = 0, XGBOOST = 1, LIGHTGBM = 2, CATBOOST = 3 };
 
-enum class BoostTask : uint8_t { REGRESSION = 0, BINARY = 1, MULTICLASS = 2 };
+enum class BoostTask : uint8_t { REGRESSION = 0, BINARY = 1, MULTICLASS = 2, RANKING = 3 };
 
-//! Training / prediction objective. AUTO derives from task (squared / logistic / softmax).
+//! Training / prediction objective. AUTO derives from task (squared / logistic / softmax / lambdarank).
 enum class BoostObjective : uint8_t {
 	AUTO = 0,
 	SQUAREDERROR = 1,
@@ -29,7 +29,9 @@ enum class BoostObjective : uint8_t {
 	SOFTMAX = 3,
 	POISSON = 4,
 	HUBER = 5,
-	QUANTILE = 6
+	QUANTILE = 6,
+	LAMBDARANK = 7,
+	PAIRWISE = 8
 };
 
 //! DEPTH: classic level/depth-wise growth. LEAF: LightGBM-style leaf-wise with max_leaves.
@@ -98,6 +100,8 @@ struct BoostModel {
 	idx_t n_classes = 1;
 	double huber_delta = 1.0;
 	double quantile_alpha = 0.5;
+	//! NDCG truncation for ranking (0 = full list).
+	idx_t ndcg_at = 0;
 	vector<string> feature_names;
 	//! For multiclass: trees laid out as [round][class] → index round * n_classes + class.
 	vector<BoostTree> trees;
@@ -112,7 +116,7 @@ struct BoostModel {
 	double EvalTree(const BoostTree &tree, const vector<double> &features) const;
 	double PredictRaw(const vector<double> &features) const;
 	vector<double> PredictRawMulti(const vector<double> &features) const;
-	//! Regression/poisson/huber/quantile mean, binary probability, or multiclass argmax class index.
+	//! Regression/poisson/huber/quantile/ranking score, binary probability, or multiclass argmax.
 	double Predict(const vector<double> &features) const;
 	vector<double> PredictProba(const vector<double> &features) const;
 };
@@ -123,6 +127,8 @@ struct TrainOptions {
 	BoostObjective objective = BoostObjective::AUTO;
 	double huber_delta = 1.0;
 	double quantile_alpha = 0.5;
+	//! NDCG@k truncation for lambdarank / eval (0 = full list).
+	idx_t ndcg_at = 0;
 	idx_t n_estimators = 10;
 	idx_t max_depth = 3;
 	double learning_rate = 0.1;
@@ -162,7 +168,8 @@ struct TrainOptions {
 };
 
 struct EvalOptions {
-	string metric = "auto"; // auto | rmse | mae | accuracy | logloss
+	string metric = "auto"; // auto | rmse | mae | accuracy | logloss | ndcg | map
+	idx_t ndcg_at = 0;      // truncation for ndcg/map (0 = full list)
 	static EvalOptions FromMap(const unordered_map<string, string> &options);
 };
 
@@ -183,11 +190,11 @@ BoostObjective ResolveObjective(BoostTask task, BoostObjective objective);
 bool BackendTrainingSupported(BoostBackend backend);
 string BackendCapabilityNote(BoostBackend backend);
 
-//! weights empty ⇒ unit weights. Length must match y when non-empty.
+//! weights empty ⇒ unit weights. groups required for task=ranking (query / list ids).
 BoostModel TrainModel(const vector<double> &y, const vector<vector<double>> &x, const TrainOptions &options,
-                      const vector<double> &weights = {});
+                      const vector<double> &weights = {}, const vector<int64_t> &groups = {});
 double EvaluateModel(const BoostModel &model, const vector<double> &y, const vector<vector<double>> &x,
-                     const EvalOptions &options);
+                     const EvalOptions &options, const vector<int64_t> &groups = {});
 string ExportModelSQL(const BoostModel &model, const string &table_name, const vector<string> &feature_columns,
                       const SqlExportOptions &options);
 

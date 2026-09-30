@@ -10,6 +10,7 @@
 #include <limits>
 #include <numeric>
 #include <unordered_set>
+#include <utility>
 
 namespace duckdb {
 namespace duckboost {
@@ -248,26 +249,32 @@ SplitCandidate FindBestSplit(const vector<vector<double>> &x, const vector<doubl
 			continue;
 		}
 
-		auto thresholds = CandidateThresholds(present_values, options.max_bins);
-		if (thresholds.empty()) {
+		// Gradient histogram: bin present values, then O(bins) prefix-sum split search.
+		auto bin_uppers = CandidateThresholds(present_values, options.max_bins);
+		if (bin_uppers.empty()) {
 			continue;
 		}
-
+		const idx_t n_bins = bin_uppers.size() + 1;
+		vector<GradStat> hist(n_bins);
+		vector<idx_t> hist_count(n_bins, 0);
+		for (auto row : present) {
+			auto value = x[row][f];
+			idx_t bin =
+			    static_cast<idx_t>(std::upper_bound(bin_uppers.begin(), bin_uppers.end(), value) - bin_uppers.begin());
+			hist[bin].Add(gradients[row], hessians[row]);
+			hist_count[bin]++;
+		}
 		GradStat left_present;
 		idx_t left_count = 0;
-		idx_t cursor = 0;
-		for (auto threshold : thresholds) {
-			while (cursor < present.size() && x[present[cursor]][f] < threshold) {
-				left_present.Add(gradients[present[cursor]], hessians[present[cursor]]);
-				left_count++;
-				cursor++;
-			}
+		for (idx_t b = 0; b + 1 < n_bins; b++) {
+			left_present.Add(hist[b]);
+			left_count += hist_count[b];
 			auto right_present = parent.Without(left_present).Without(missing_stat);
 			idx_t right_count = present.size() - left_count;
 			if (left_count == 0 || right_count == 0) {
 				continue;
 			}
-
+			auto threshold = bin_uppers[b];
 			GradStat left_m = left_present;
 			left_m.Add(missing_stat);
 			ConsiderSplit(best, f, threshold, true, SplitCompare::LESS, left_m, right_present, parent,
@@ -344,6 +351,97 @@ idx_t BuildTree(BoostTree &tree, const vector<vector<double>> &x, const vector<d
 	tree.nodes[node_idx].right =
 	    BuildTree(tree, x, gradients, hessians, right_rows, feature_subset, cat_set, depth + 1, options);
 	return node_idx;
+}
+
+idx_t EffectiveMaxLeaves(const TrainOptions &options) {
+	if (options.max_leaves > 0) {
+		return options.max_leaves;
+	}
+	return 31;
+}
+
+idx_t BuildTreeLeafWise(BoostTree &tree, const vector<vector<double>> &x, const vector<double> &gradients,
+                        const vector<double> &hessians, const vector<idx_t> &rows, const vector<idx_t> &feature_subset,
+                        const unordered_set<idx_t> &cat_set, const TrainOptions &options) {
+	struct Expandable {
+		idx_t node_idx = 0;
+		idx_t depth = 0;
+		vector<idx_t> rows;
+		SplitCandidate split;
+	};
+
+	auto parent = SumStats(gradients, hessians, rows);
+	idx_t root = BuildLeaf(tree, LeafWeight(parent, options));
+	if (rows.size() < 2 * options.min_samples_leaf) {
+		return root;
+	}
+
+	vector<Expandable> frontier;
+	auto enqueue = [&](idx_t node_idx, idx_t depth, vector<idx_t> node_rows) {
+		if (depth >= options.max_depth || node_rows.size() < 2 * options.min_samples_leaf) {
+			return;
+		}
+		auto split = FindBestSplit(x, gradients, hessians, node_rows, feature_subset, cat_set, options);
+		if (!std::isfinite(split.gain) || split.gain <= 0) {
+			return;
+		}
+		Expandable entry;
+		entry.node_idx = node_idx;
+		entry.depth = depth;
+		entry.rows = std::move(node_rows);
+		entry.split = split;
+		frontier.push_back(std::move(entry));
+	};
+	enqueue(root, 0, rows);
+
+	idx_t leaf_count = 1;
+	const idx_t max_leaves = EffectiveMaxLeaves(options);
+	while (leaf_count < max_leaves && !frontier.empty()) {
+		idx_t best_i = 0;
+		for (idx_t i = 1; i < frontier.size(); i++) {
+			if (frontier[i].split.gain > frontier[best_i].split.gain) {
+				best_i = i;
+			}
+		}
+		auto cur = std::move(frontier[best_i]);
+		frontier.erase(frontier.begin() + static_cast<int64_t>(best_i));
+
+		vector<idx_t> left_rows;
+		vector<idx_t> right_rows;
+		PartitionRows(x, cur.rows, cur.split, left_rows, right_rows);
+		if (left_rows.empty() || right_rows.empty()) {
+			continue;
+		}
+
+		auto left_stat = SumStats(gradients, hessians, left_rows);
+		auto right_stat = SumStats(gradients, hessians, right_rows);
+		idx_t left_idx = BuildLeaf(tree, LeafWeight(left_stat, options));
+		idx_t right_idx = BuildLeaf(tree, LeafWeight(right_stat, options));
+
+		auto &node = tree.nodes[cur.node_idx];
+		node.is_leaf = false;
+		node.value = 0;
+		node.feature = cur.split.feature;
+		node.threshold = cur.split.threshold;
+		node.default_left = cur.split.default_left;
+		node.compare = cur.split.compare;
+		node.left = left_idx;
+		node.right = right_idx;
+
+		leaf_count++;
+		enqueue(left_idx, cur.depth + 1, std::move(left_rows));
+		enqueue(right_idx, cur.depth + 1, std::move(right_rows));
+	}
+	return root;
+}
+
+idx_t GrowTree(BoostTree &tree, const vector<vector<double>> &x, const vector<double> &gradients,
+               const vector<double> &hessians, const vector<idx_t> &rows, const vector<idx_t> &feature_subset,
+               const unordered_set<idx_t> &cat_set, const TrainOptions &options) {
+	if (options.grow_policy == GrowPolicy::LEAF) {
+		return BuildTreeLeafWise(tree, x, gradients, hessians, rows, feature_subset, cat_set, options);
+	}
+	return BuildTree(tree, x, gradients, hessians, rows, feature_subset, cat_set, 0, options);
 }
 
 vector<idx_t> SampleRows(idx_t n_rows, double subsample, SimpleRng &rng) {
@@ -691,7 +789,7 @@ BoostModel TrainReference(const vector<double> &y, const vector<vector<double>> 
 					hessians[i] = weights[i] * std::max(p * (1.0 - p), 1e-6);
 				}
 				BoostTree tree;
-				BuildTree(tree, x, gradients, hessians, grow_rows, feature_subset, cat_set, 0, options);
+				GrowTree(tree, x, gradients, hessians, grow_rows, feature_subset, cat_set, options);
 				for (idx_t i = 0; i < y.size(); i++) {
 					prediction[i][c] += options.learning_rate * ApplyTree(tree, x[i]);
 				}
@@ -773,7 +871,7 @@ BoostModel TrainReference(const vector<double> &y, const vector<vector<double>> 
 		auto feature_subset = SampleFeatures(n_features, options.colsample_bytree, rng);
 
 		BoostTree tree;
-		BuildTree(tree, x, gradients, hessians, grow_rows, feature_subset, cat_set, 0, options);
+		GrowTree(tree, x, gradients, hessians, grow_rows, feature_subset, cat_set, options);
 		for (idx_t i = 0; i < y.size(); i++) {
 			prediction[i] += options.learning_rate * ApplyTree(tree, x[i]);
 		}
@@ -808,7 +906,7 @@ BoostModel TrainModel(const vector<double> &y, const vector<vector<double>> &x, 
 		return TrainReference(y, x, options, weights);
 	}
 	if (NativeTrainerCompiled(options.backend)) {
-		return TrainNative(y, x, options);
+		return TrainNative(y, x, options, weights);
 	}
 	throw NotImplementedException(
 	    "duckboost: native training for backend '%s' is not linked in this build. "

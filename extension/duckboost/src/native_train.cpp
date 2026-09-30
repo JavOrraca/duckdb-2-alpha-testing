@@ -5,6 +5,8 @@
 #include "duckdb/common/numeric_utils.hpp"
 #include "duckdb/common/string_util.hpp"
 
+#include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -137,6 +139,102 @@ idx_t InferClassCount(const vector<double> &y, const TrainOptions &options) {
 	return inferred;
 }
 
+idx_t EffectiveMaxLeavesNative(const TrainOptions &options) {
+	if (options.max_leaves > 0) {
+		return options.max_leaves;
+	}
+	return 31;
+}
+
+vector<idx_t> ResolveNativeCatFeatures(const TrainOptions &options, idx_t n_features) {
+	vector<idx_t> cats = options.cat_features;
+	for (auto &token : options.cat_feature_tokens) {
+		bool all_digits = !token.empty() && std::isdigit(static_cast<unsigned char>(token[0]));
+		for (idx_t i = 1; all_digits && i < token.size(); i++) {
+			if (!std::isdigit(static_cast<unsigned char>(token[i]))) {
+				all_digits = false;
+			}
+		}
+		if (all_digits) {
+			continue;
+		}
+		bool found = false;
+		for (idx_t i = 0; i < options.feature_names.size(); i++) {
+			if (StringUtil::Lower(options.feature_names[i]) == StringUtil::Lower(token)) {
+				cats.push_back(i);
+				found = true;
+				break;
+			}
+		}
+		if (!found) {
+			throw InvalidInputException("duckboost: cat_features name '%s' not found in feature_names", token);
+		}
+	}
+	std::sort(cats.begin(), cats.end());
+	cats.erase(std::unique(cats.begin(), cats.end()), cats.end());
+	for (auto idx : cats) {
+		if (idx >= n_features) {
+			throw InvalidInputException("duckboost: cat_features index %llu out of range for %llu features",
+			                            (unsigned long long)idx, (unsigned long long)n_features);
+		}
+	}
+	return cats;
+}
+
+vector<float> ResolveNativeWeights(const vector<double> &y, const TrainOptions &options, const vector<double> &weights,
+                                   idx_t n_classes_for_weight) {
+	vector<float> out(y.size(), 1.0f);
+	if (!weights.empty()) {
+		if (weights.size() != y.size()) {
+			throw InvalidInputException("duckboost: sample weight count (%llu) must match row count (%llu)",
+			                            (unsigned long long)weights.size(), (unsigned long long)y.size());
+		}
+		for (idx_t i = 0; i < y.size(); i++) {
+			if (!std::isfinite(weights[i]) || weights[i] < 0) {
+				throw InvalidInputException("duckboost: sample weights must be finite and >= 0");
+			}
+			out[i] = static_cast<float>(weights[i]);
+		}
+	}
+	if (options.class_weight.empty() || n_classes_for_weight < 2) {
+		return out;
+	}
+	vector<double> multipliers(n_classes_for_weight, 1.0);
+	auto lower = StringUtil::Lower(options.class_weight);
+	if (lower == "balanced") {
+		vector<double> counts(n_classes_for_weight, 0);
+		double total = 0;
+		for (idx_t i = 0; i < y.size(); i++) {
+			auto label = static_cast<idx_t>(y[i]);
+			if (label >= n_classes_for_weight) {
+				continue;
+			}
+			counts[label] += out[i];
+			total += out[i];
+		}
+		for (idx_t c = 0; c < n_classes_for_weight; c++) {
+			multipliers[c] = counts[c] <= 0 ? 0 : total / (static_cast<double>(n_classes_for_weight) * counts[c]);
+		}
+	} else {
+		auto parts = StringUtil::Split(options.class_weight, ',');
+		if (parts.size() != n_classes_for_weight) {
+			throw InvalidInputException("duckboost: class_weight list length (%llu) must match n_classes (%llu)",
+			                            (unsigned long long)parts.size(), (unsigned long long)n_classes_for_weight);
+		}
+		for (idx_t c = 0; c < n_classes_for_weight; c++) {
+			StringUtil::Trim(parts[c]);
+			multipliers[c] = std::stod(parts[c]);
+		}
+	}
+	for (idx_t i = 0; i < y.size(); i++) {
+		auto label = static_cast<idx_t>(y[i]);
+		if (label < n_classes_for_weight) {
+			out[i] = static_cast<float>(static_cast<double>(out[i]) * multipliers[label]);
+		}
+	}
+	return out;
+}
+
 #if defined(DUCKBOOST_WITH_XGBOOST) && !defined(DUCKBOOST_NATIVE_STUB)
 
 [[noreturn]] void ThrowXGBoostError(const char *context) {
@@ -144,11 +242,15 @@ idx_t InferClassCount(const vector<double> &y, const TrainOptions &options) {
 	throw InvalidInputException("duckboost: xgboost %s failed: %s", context, err ? err : "unknown error");
 }
 
-BoostModel TrainWithXGBoost(const vector<double> &y, const vector<vector<double>> &x, const TrainOptions &options) {
+BoostModel TrainWithXGBoost(const vector<double> &y, const vector<vector<double>> &x, const TrainOptions &options,
+                            const vector<double> &weights) {
 	EnsureRectangular(y, x);
 	const idx_t nrow = y.size();
 	const idx_t ncol = x[0].size();
 	const idx_t n_classes = InferClassCount(y, options);
+	const idx_t weight_classes = options.task == BoostTask::BINARY ? 2 : n_classes;
+	auto cat_indices = ResolveNativeCatFeatures(options, ncol);
+	auto weight_f = ResolveNativeWeights(y, options, weights, weight_classes);
 
 	vector<float> flat(nrow * ncol);
 	vector<float> labels(nrow);
@@ -168,6 +270,10 @@ BoostModel TrainWithXGBoost(const vector<double> &y, const vector<vector<double>
 		XGDMatrixFree(dmat);
 		ThrowXGBoostError("XGDMatrixSetFloatInfo(label)");
 	}
+	if (XGDMatrixSetFloatInfo(dmat, "weight", weight_f.data(), static_cast<bst_ulong>(nrow)) != 0) {
+		XGDMatrixFree(dmat);
+		ThrowXGBoostError("XGDMatrixSetFloatInfo(weight)");
+	}
 
 	BoosterHandle booster = nullptr;
 	const DMatrixHandle dmats[] = {dmat};
@@ -186,6 +292,7 @@ BoostModel TrainWithXGBoost(const vector<double> &y, const vector<vector<double>
 
 	set_param("verbosity", "0");
 	set_param("max_depth", std::to_string(options.max_depth));
+	set_param("max_bin", std::to_string(MaxValue<idx_t>(options.max_bins, 2)));
 	set_param("eta", std::to_string(options.learning_rate));
 	set_param("min_child_weight", std::to_string(options.min_child_weight));
 	set_param("lambda", std::to_string(options.reg_lambda));
@@ -195,6 +302,12 @@ BoostModel TrainWithXGBoost(const vector<double> &y, const vector<vector<double>
 	set_param("colsample_bytree", std::to_string(options.colsample_bytree));
 	set_param("seed", std::to_string(options.seed));
 	set_param("objective", ObjectiveForXGBoost(options.task, n_classes));
+	if (options.grow_policy == GrowPolicy::LEAF) {
+		set_param("grow_policy", "lossguide");
+		set_param("max_leaves", std::to_string(EffectiveMaxLeavesNative(options)));
+	} else {
+		set_param("grow_policy", "depthwise");
+	}
 	if (options.task == BoostTask::MULTICLASS) {
 		set_param("num_class", std::to_string(n_classes));
 	}
@@ -210,15 +323,26 @@ BoostModel TrainWithXGBoost(const vector<double> &y, const vector<vector<double>
 	bst_ulong out_len = 0;
 	const char **out_dump = nullptr;
 	int dump_rc = 0;
+	vector<string> dummy_names;
+	vector<const char *> fnames(ncol);
+	vector<const char *> ftypes(ncol, "q");
+	for (auto idx : cat_indices) {
+		ftypes[idx] = "c";
+	}
 	if (!options.feature_names.empty() && options.feature_names.size() == ncol) {
-		vector<const char *> fnames(ncol);
-		vector<const char *> ftypes(ncol, "q");
 		for (idx_t i = 0; i < ncol; i++) {
 			fnames[i] = options.feature_names[i].c_str();
 		}
-		dump_rc = XGBoosterDumpModelExWithFeatures(booster, static_cast<int>(ncol), fnames.data(), ftypes.data(), 0,
-		                                           "json", &out_len, &out_dump);
 	} else {
+		dummy_names.resize(ncol);
+		for (idx_t i = 0; i < ncol; i++) {
+			dummy_names[i] = "f" + std::to_string(i);
+			fnames[i] = dummy_names[i].c_str();
+		}
+	}
+	dump_rc = XGBoosterDumpModelExWithFeatures(booster, static_cast<int>(ncol), fnames.data(), ftypes.data(), 0, "json",
+	                                           &out_len, &out_dump);
+	if (dump_rc != 0 || !out_dump) {
 		dump_rc = XGBoosterDumpModelEx(booster, "", 0, "json", &out_len, &out_dump);
 	}
 	if (dump_rc != 0 || !out_dump) {
@@ -256,11 +380,15 @@ BoostModel TrainWithXGBoost(const vector<double> &y, const vector<vector<double>
 	throw InvalidInputException("duckboost: lightgbm %s failed: %s", context, err ? err : "unknown error");
 }
 
-BoostModel TrainWithLightGBM(const vector<double> &y, const vector<vector<double>> &x, const TrainOptions &options) {
+BoostModel TrainWithLightGBM(const vector<double> &y, const vector<vector<double>> &x, const TrainOptions &options,
+                             const vector<double> &weights) {
 	EnsureRectangular(y, x);
 	const auto nrow = NumericCast<int32_t>(y.size());
 	const auto ncol = NumericCast<int32_t>(x[0].size());
 	const idx_t n_classes = InferClassCount(y, options);
+	const idx_t weight_classes = options.task == BoostTask::BINARY ? 2 : n_classes;
+	auto cat_indices = ResolveNativeCatFeatures(options, static_cast<idx_t>(ncol));
+	auto weight_f = ResolveNativeWeights(y, options, weights, weight_classes);
 
 	vector<double> flat(static_cast<idx_t>(nrow) * static_cast<idx_t>(ncol));
 	vector<float> labels(static_cast<idx_t>(nrow));
@@ -273,6 +401,15 @@ BoostModel TrainWithLightGBM(const vector<double> &y, const vector<vector<double
 	}
 
 	string dataset_params = "max_bin=" + std::to_string(MaxValue<idx_t>(options.max_bins, 2));
+	if (!cat_indices.empty()) {
+		dataset_params += " categorical_feature=";
+		for (idx_t i = 0; i < cat_indices.size(); i++) {
+			if (i > 0) {
+				dataset_params += ',';
+			}
+			dataset_params += std::to_string(cat_indices[i]);
+		}
+	}
 
 	DatasetHandle dataset = nullptr;
 	if (LGBM_DatasetCreateFromMat(flat.data(), C_API_DTYPE_FLOAT64, nrow, ncol, 1, dataset_params.c_str(), nullptr,
@@ -282,6 +419,10 @@ BoostModel TrainWithLightGBM(const vector<double> &y, const vector<vector<double
 	if (LGBM_DatasetSetField(dataset, "label", labels.data(), nrow, C_API_DTYPE_FLOAT32) != 0) {
 		LGBM_DatasetFree(dataset);
 		ThrowLightGBMError("LGBM_DatasetSetField(label)");
+	}
+	if (LGBM_DatasetSetField(dataset, "weight", weight_f.data(), nrow, C_API_DTYPE_FLOAT32) != 0) {
+		LGBM_DatasetFree(dataset);
+		ThrowLightGBMError("LGBM_DatasetSetField(weight)");
 	}
 	if (!options.feature_names.empty() && options.feature_names.size() == static_cast<idx_t>(ncol)) {
 		vector<const char *> fnames(static_cast<idx_t>(ncol));
@@ -294,12 +435,17 @@ BoostModel TrainWithLightGBM(const vector<double> &y, const vector<vector<double
 		}
 	}
 
+	idx_t num_leaves = options.grow_policy == GrowPolicy::LEAF
+	                       ? EffectiveMaxLeavesNative(options)
+	                       : MaxValue<idx_t>(2, 1ULL << MinValue<idx_t>(options.max_depth, 10));
+	if (options.max_leaves > 0) {
+		num_leaves = options.max_leaves;
+	}
 	string params = StringUtil::Format(
 	    "objective=%s learning_rate=%g num_leaves=%llu max_depth=%llu min_data_in_leaf=%llu "
 	    "min_sum_hessian_in_leaf=%g lambda_l2=%g lambda_l1=%g min_gain_to_split=%g "
 	    "bagging_fraction=%g feature_fraction=%g bagging_freq=1 seed=%llu verbosity=-1 force_col_wise=true",
-	    ObjectiveForLightGBM(options.task, n_classes), options.learning_rate,
-	    (unsigned long long)MaxValue<idx_t>(2, 1ULL << MinValue<idx_t>(options.max_depth, 10)),
+	    ObjectiveForLightGBM(options.task, n_classes), options.learning_rate, (unsigned long long)num_leaves,
 	    (unsigned long long)options.max_depth, (unsigned long long)MaxValue<idx_t>(options.min_samples_leaf, 1),
 	    options.min_child_weight, options.reg_lambda, options.reg_alpha, options.min_split_gain, options.subsample,
 	    options.colsample_bytree, (unsigned long long)options.seed);
@@ -408,7 +554,8 @@ bool NativeTrainerLinked(BoostBackend backend) {
 #endif
 }
 
-BoostModel TrainNative(const vector<double> &y, const vector<vector<double>> &x, const TrainOptions &options) {
+BoostModel TrainNative(const vector<double> &y, const vector<vector<double>> &x, const TrainOptions &options,
+                       const vector<double> &weights) {
 	if (!NativeTrainerCompiled(options.backend)) {
 		throw NotImplementedException("duckboost: native training for backend '%s' is not linked in this build. "
 		                              "Configure with -DDUCKBOOST_WITH_%s=ON (and install the vendor library), "
@@ -427,13 +574,13 @@ BoostModel TrainNative(const vector<double> &y, const vector<vector<double>> &x,
 	switch (options.backend) {
 	case BoostBackend::XGBOOST:
 #if defined(DUCKBOOST_WITH_XGBOOST) && !defined(DUCKBOOST_NATIVE_STUB)
-		return TrainWithXGBoost(y, x, options);
+		return TrainWithXGBoost(y, x, options, weights);
 #else
 		break;
 #endif
 	case BoostBackend::LIGHTGBM:
 #if defined(DUCKBOOST_WITH_LIGHTGBM) && !defined(DUCKBOOST_NATIVE_STUB)
-		return TrainWithLightGBM(y, x, options);
+		return TrainWithLightGBM(y, x, options, weights);
 #else
 		break;
 #endif

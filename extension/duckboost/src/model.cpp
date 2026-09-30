@@ -258,6 +258,8 @@ string TaskToString(BoostTask task) {
 		return "binary";
 	case BoostTask::MULTICLASS:
 		return "multiclass";
+	case BoostTask::RANKING:
+		return "ranking";
 	case BoostTask::REGRESSION:
 	default:
 		return "regression";
@@ -275,7 +277,11 @@ BoostTask TaskFromString(const string &name) {
 	if (lower == "multiclass" || lower == "multi_class" || lower == "multi-class" || lower == "softmax") {
 		return BoostTask::MULTICLASS;
 	}
-	throw InvalidInputException("duckboost: unknown task '%s' (expected regression, binary, or multiclass)", name);
+	if (lower == "ranking" || lower == "rank" || lower == "ltr" || lower == "learn_to_rank") {
+		return BoostTask::RANKING;
+	}
+	throw InvalidInputException("duckboost: unknown task '%s' (expected regression, binary, multiclass, or ranking)",
+	                            name);
 }
 
 string ObjectiveToString(BoostObjective objective) {
@@ -292,6 +298,10 @@ string ObjectiveToString(BoostObjective objective) {
 		return "huber";
 	case BoostObjective::QUANTILE:
 		return "quantile";
+	case BoostObjective::LAMBDARANK:
+		return "lambdarank";
+	case BoostObjective::PAIRWISE:
+		return "pairwise";
 	case BoostObjective::AUTO:
 	default:
 		return "auto";
@@ -322,9 +332,15 @@ BoostObjective ObjectiveFromString(const string &name) {
 	if (lower == "quantile" || lower == "reg:quantileerror" || lower == "quantileerror") {
 		return BoostObjective::QUANTILE;
 	}
-	throw InvalidInputException(
-	    "duckboost: unknown objective '%s' (expected auto, squarederror, logistic, softmax, poisson, huber, quantile)",
-	    name);
+	if (lower == "lambdarank" || lower == "rank:ndcg" || lower == "ndcg") {
+		return BoostObjective::LAMBDARANK;
+	}
+	if (lower == "pairwise" || lower == "rank:pairwise" || lower == "rank_pairwise") {
+		return BoostObjective::PAIRWISE;
+	}
+	throw InvalidInputException("duckboost: unknown objective '%s' (expected auto, squarederror, logistic, softmax, "
+	                            "poisson, huber, quantile, lambdarank, pairwise)",
+	                            name);
 }
 
 BoostObjective ResolveObjective(BoostTask task, BoostObjective objective) {
@@ -334,6 +350,8 @@ BoostObjective ResolveObjective(BoostTask task, BoostObjective objective) {
 			return BoostObjective::LOGISTIC;
 		case BoostTask::MULTICLASS:
 			return BoostObjective::SOFTMAX;
+		case BoostTask::RANKING:
+			return BoostObjective::LAMBDARANK;
 		case BoostTask::REGRESSION:
 		default:
 			return BoostObjective::SQUAREDERROR;
@@ -348,6 +366,13 @@ BoostObjective ResolveObjective(BoostTask task, BoostObjective objective) {
 	case BoostObjective::SOFTMAX:
 		if (task != BoostTask::MULTICLASS) {
 			throw InvalidInputException("duckboost: objective 'softmax' requires task 'multiclass'");
+		}
+		break;
+	case BoostObjective::LAMBDARANK:
+	case BoostObjective::PAIRWISE:
+		if (task != BoostTask::RANKING) {
+			throw InvalidInputException("duckboost: objective '%s' requires task 'ranking'",
+			                            ObjectiveToString(objective));
 		}
 		break;
 	case BoostObjective::SQUAREDERROR:
@@ -377,6 +402,10 @@ void AlignTaskWithObjective(TrainOptions &options) {
 	case BoostObjective::SOFTMAX:
 		options.task = BoostTask::MULTICLASS;
 		break;
+	case BoostObjective::LAMBDARANK:
+	case BoostObjective::PAIRWISE:
+		options.task = BoostTask::RANKING;
+		break;
 	case BoostObjective::SQUAREDERROR:
 	case BoostObjective::POISSON:
 	case BoostObjective::HUBER:
@@ -391,7 +420,8 @@ void AlignTaskWithObjective(TrainOptions &options) {
 bool ObjectiveKeyIsLegacyTask(const string &name) {
 	auto lower = StringUtil::Lower(name);
 	return lower == "regression" || lower == "regressor" || lower == "binary" || lower == "classification" ||
-	       lower == "binomial" || lower == "multiclass" || lower == "multi_class" || lower == "multi-class";
+	       lower == "binomial" || lower == "multiclass" || lower == "multi_class" || lower == "multi-class" ||
+	       lower == "ranking" || lower == "rank" || lower == "ltr";
 }
 
 bool BackendTrainingSupported(BoostBackend backend) {
@@ -404,7 +434,7 @@ bool BackendTrainingSupported(BoostBackend backend) {
 string BackendCapabilityNote(BoostBackend backend) {
 	switch (backend) {
 	case BoostBackend::REFERENCE:
-		return "in-process reference GBDT (poisson/huber/quantile, missing defaults, categoricals, multiclass, "
+		return "in-process reference GBDT (ranking/lambdarank, poisson/huber/quantile, categoricals, multiclass, "
 		       "weights)";
 	case BoostBackend::XGBOOST:
 		if (NativeTrainerLinked(backend)) {
@@ -454,6 +484,8 @@ TrainOptions TrainOptions::FromMap(const unordered_map<string, string> &options)
 			result.huber_delta = std::stod(value);
 		} else if (key == "quantile_alpha" || key == "quantile") {
 			result.quantile_alpha = std::stod(value);
+		} else if (key == "ndcg_at" || key == "eval_at" || key == "ndcg_eval_at") {
+			result.ndcg_at = static_cast<idx_t>(std::stoull(value));
 		} else if (key == "n_estimators" || key == "num_boost_round" || key == "iterations") {
 			result.n_estimators = static_cast<idx_t>(std::stoull(value));
 		} else if (key == "max_depth" || key == "depth") {
@@ -572,6 +604,8 @@ EvalOptions EvalOptions::FromMap(const unordered_map<string, string> &options) {
 		auto key = StringUtil::Lower(entry.first);
 		if (key == "metric") {
 			result.metric = StringUtil::Lower(entry.second);
+		} else if (key == "ndcg_at" || key == "eval_at" || key == "k") {
+			result.ndcg_at = static_cast<idx_t>(std::stoull(entry.second));
 		} else {
 			throw InvalidInputException("duckboost: unknown evaluate option '%s'", entry.first);
 		}
@@ -614,6 +648,9 @@ string BoostModel::ToJSON() const {
 	}
 	if (objective == BoostObjective::QUANTILE || quantile_alpha != 0.5) {
 		out << ",\"quantile_alpha\":" << FormatDouble(quantile_alpha);
+	}
+	if (task == BoostTask::RANKING || ndcg_at > 0) {
+		out << ",\"ndcg_at\":" << ndcg_at;
 	}
 	out << ",\"base_score\":" << FormatDouble(base_score);
 	if (!base_scores.empty()) {
@@ -752,6 +789,8 @@ BoostModel BoostModel::FromJSON(const string &json) {
 			model.huber_delta = p.ParseNumber();
 		} else if (key == "quantile_alpha") {
 			model.quantile_alpha = p.ParseNumber();
+		} else if (key == "ndcg_at") {
+			model.ndcg_at = static_cast<idx_t>(p.ParseNumber());
 		} else if (key == "base_score") {
 			model.base_score = p.ParseNumber();
 		} else if (key == "base_scores") {
@@ -1099,7 +1138,7 @@ double BoostModel::Predict(const vector<double> &features) const {
 }
 
 vector<double> BoostModel::PredictProba(const vector<double> &features) const {
-	if (task == BoostTask::REGRESSION) {
+	if (task == BoostTask::REGRESSION || task == BoostTask::RANKING) {
 		return {Predict(features)};
 	}
 	if (task == BoostTask::BINARY) {

@@ -67,8 +67,8 @@ SELECT duckboost_train(
 )
 FROM train;
 
-# NULL weights are rejected
+# NULL weights are rejected (cast required: bare NULL can bind to BIGINT group)
 statement error
-SELECT duckboost_train(y, [x1], NULL) FROM train;
+SELECT duckboost_train(y, [x1], NULL::DOUBLE) FROM train;
 ----
 sample weight cannot be NULL

@@ -1,0 +1,138 @@
+# name: test/sql/duckboost/ranking.test
+# description: duckboost learning-to-rank (lambdarank / pairwise) with group ids
+# group: [duckboost]
+
+require duckboost
+
+# Synthetic queries: higher feature x1 should rank above lower within each qid
+statement ok
+CREATE TABLE rank_train AS
+SELECT * FROM (VALUES
+	(1::BIGINT, 3.0, 3.0),
+	(1::BIGINT, 1.0, 1.0),
+	(1::BIGINT, 2.0, 2.0),
+	(2::BIGINT, 0.5, 0.0),
+	(2::BIGINT, 2.5, 2.0),
+	(2::BIGINT, 1.5, 1.0),
+	(3::BIGINT, 4.0, 3.0),
+	(3::BIGINT, 1.0, 0.0),
+	(3::BIGINT, 3.0, 2.0),
+	(4::BIGINT, 0.0, 0.0),
+	(4::BIGINT, 3.5, 3.0),
+	(4::BIGINT, 2.0, 1.0),
+	(5::BIGINT, 5.0, 3.0),
+	(5::BIGINT, 2.0, 1.0),
+	(5::BIGINT, 4.0, 2.0),
+	(6::BIGINT, 1.0, 1.0),
+	(6::BIGINT, 3.0, 3.0),
+	(6::BIGINT, 2.0, 2.0)
+) t(qid, x1, y);
+
+statement ok
+CREATE TABLE rank_models AS
+SELECT duckboost_train(
+	y,
+	[x1],
+	qid,
+	MAP {
+		'backend': 'reference',
+		'task': 'ranking',
+		'objective': 'lambdarank',
+		'n_estimators': '50',
+		'max_depth': '3',
+		'learning_rate': '0.1',
+		'reg_lambda': '1.0',
+		'min_child_weight': '0',
+		'ndcg_at': '3',
+		'seed': '11'
+	}
+) AS model
+FROM rank_train;
+
+query I
+SELECT model LIKE '%"task":"ranking"%' AND model LIKE '%"objective":"lambdarank"%'
+FROM rank_models;
+----
+true
+
+# Within a query, higher relevance item should score higher
+query I
+SELECT
+	duckboost_predict(model, [3.0]) > duckboost_predict(model, [1.0])
+FROM rank_models;
+----
+true
+
+# NDCG evaluate_agg with groups
+query I
+SELECT duckboost_evaluate_agg(
+	m.model, t.y, [t.x1], t.qid, MAP {'metric': 'ndcg', 'ndcg_at': '3'}
+) > 0.7
+FROM rank_models m, rank_train t;
+----
+true
+
+# Pairwise objective + objective alias sets task=ranking
+statement ok
+CREATE TABLE pairwise_models AS
+SELECT duckboost_train(
+	y, [x1], qid,
+	MAP {
+		'objective': 'pairwise',
+		'n_estimators': '25',
+		'max_depth': '2',
+		'learning_rate': '0.2',
+		'seed': '3'
+	}
+) AS model
+FROM rank_train;
+
+query I
+SELECT model LIKE '%"task":"ranking"%' FROM pairwise_models;
+----
+true
+
+query I
+SELECT duckboost_predict(model, [4.0]) > duckboost_predict(model, [1.0])
+FROM pairwise_models;
+----
+true
+
+# Ranking without groups fails
+statement error
+SELECT duckboost_train(
+	y, [x1],
+	MAP {'task': 'ranking', 'n_estimators': '5', 'max_depth': '2'}
+)
+FROM rank_train;
+----
+<REGEX>:.*ranking requires a group id.*
+
+# Group id cannot be NULL
+statement error
+SELECT duckboost_train(y, [x1], NULL::BIGINT, MAP {'task': 'ranking', 'n_estimators': '2'})
+FROM rank_train;
+----
+group id cannot be NULL
+
+# Early stopping with group-intact validation split
+statement ok
+CREATE TABLE early_rank AS
+SELECT duckboost_train(
+	y, [x1], qid,
+	MAP {
+		'task': 'ranking',
+		'n_estimators': '40',
+		'max_depth': '2',
+		'learning_rate': '0.3',
+		'early_stopping_rounds': '3',
+		'validation_fraction': '0.35',
+		'seed': '9'
+	}
+) AS model
+FROM rank_train;
+
+query I
+SELECT length(regexp_extract_all(model, '"nodes"')) <= 40 FROM early_rank;
+----
+true
